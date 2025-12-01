@@ -292,4 +292,65 @@ if run_button:
             color="type",
             size="dollar_notional",
             hover_data=["expiry", "dte", "delta_bucket", "reason"],
-            labels={"dollar_notional": "Notio_
+            labels={"dollar_notional": "Notional ($)", "strike": "Strike"},
+            title="Unusual Trades by Strike and Notional",
+        )
+        st.plotly_chart(fig_unusual, use_container_width=True)
+
+        st.dataframe(
+            unusual_df.head(200).style.format(
+                {
+                    "dollar_notional": "{:,.0f}",
+                    "volume": "{:,.0f}",
+                    "openInterest": "{:,.0f}",
+                    "vol_oi_ratio": "{:,.2f}",
+                    "iv": "{:.3f}",
+                    "delta": "{:.3f}",
+                    "gamma": "{:.3f}",
+                    "vega": "{:.3f}",
+                    "theta": "{:.3f}",
+                    "moneyness": "{:.3%}",
+                    "vol_vs_hist": "{:.2f}",
+                    "oi_change_ratio": "{:.2f}",
+                }
+            ),
+            use_container_width=True,
+        )
+
+    st.markdown("---")
+
+    # -----------------------------------------------------
+    # Notional clusters
+    # -----------------------------------------------------
+    st.subheader("Notional Clusters by Expiry & Moneyness")
+
+    if not clusters.empty:
+        st.dataframe(
+            clusters.head(50).style.format(
+                {
+                    "total_notional": "{:,.0f}",
+                    "call_notional": "{:,.0f}",
+                    "put_notional": "{:,.0f}",
+                    "net_call_minus_put": "{:,.0f}",
+                    "avg_moneyness": "{:.2%}",
+                }
+            ),
+            use_container_width=True,
+        )
+
+        fig_clusters = px.bar(
+            clusters.head(20),
+            x="moneyness_band",
+            y="total_notional",
+            color="expiry",
+            labels={
+                "moneyness_band": "Moneyness band (% from spot)",
+                "total_notional": "Total notional ($)",
+            },
+            title="Top Notional Clusters (by expiry & moneyness band)",
+        )
+        st.plotly_chart(fig_clusters, use_container_width=True)
+    else:
+        st.info("No cluster information available.")
+else:
+    st.info("Set your parameters in the sidebar and click **Run analysis**.")
