@@ -1,7 +1,6 @@
 # app.py
 import streamlit as st
 import pandas as pd
-import numpy as np
 import plotly.express as px
 
 from spx_options_flow_v2 import (
@@ -9,6 +8,9 @@ from spx_options_flow_v2 import (
     UnusualConfig,
 )
 
+# ---------------------------------------------------------
+# Streamlit page config
+# ---------------------------------------------------------
 st.set_page_config(
     page_title="Options Flow & Gamma Dashboard",
     layout="wide",
@@ -18,17 +20,17 @@ st.title("Options Flow & Gamma Dashboard")
 
 st.markdown(
     """
-This app wraps your analysis engine around a simple UI.
+This app wraps your options-analysis engine in a simple UI:
 
 - Choose a ticker (SPY / QQQ / etc.)
-- Adjust how aggressive the **unusual activity** filter is
+- Adjust how aggressive the **unusual activity** filters are
 - Inspect price, gamma walls, and flagged options flow
 """
 )
 
-# ------------------------------
+# ---------------------------------------------------------
 # Sidebar controls
-# ------------------------------
+# ---------------------------------------------------------
 st.sidebar.header("Settings")
 
 ticker = st.sidebar.text_input("Underlying ticker", value="SPY").upper()
@@ -39,8 +41,19 @@ max_expiries = st.sidebar.selectbox(
     index=2,
 )
 
-rate = st.sidebar.number_input("Risk-free rate (annual)", value=0.04, step=0.005, format="%.3f")
-div_yield = st.sidebar.number_input("Dividend yield (annual)", value=0.012, step=0.002, format="%.3f")
+rate = st.sidebar.number_input(
+    "Risk-free rate (annual)",
+    value=0.04,
+    step=0.005,
+    format="%.3f",
+)
+
+div_yield = st.sidebar.number_input(
+    "Dividend yield (annual)",
+    value=0.012,
+    step=0.002,
+    format="%.3f",
+)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Unusual activity filters (advanced)")
@@ -51,7 +64,7 @@ notional_pct = st.sidebar.slider(
     max_value=0.995,
     value=0.97,
     step=0.005,
-    help="0.97 = top 3% by notional volume intraday",
+    help="0.97 ≈ top 3% by notional volume intraday",
 )
 
 volume_pct = st.sidebar.slider(
@@ -80,14 +93,14 @@ min_vol_vs_hist = st.sidebar.number_input(
     "Min volume vs history (x)",
     value=5.0,
     step=1.0,
-    help="Only used once you have a few days of snapshots",
+    help="Only kicks in once you have history snapshots stored.",
 )
 
 min_oi_change_ratio = st.sidebar.number_input(
     "Min OI change ratio",
     value=0.5,
     step=0.1,
-    help="0.5 = OI up at least 50% vs yesterday",
+    help="0.5 = OI up at least 50% vs yesterday.",
 )
 
 max_dte_short = st.sidebar.number_input(
@@ -101,18 +114,15 @@ history_lookback = st.sidebar.number_input(
     "History lookback (days)",
     value=60,
     step=10,
-    help="Used for vol vs history & IV rank (once snapshots accumulate).",
+    help="Used for volume-vs-history & IV rank (once snapshots accumulate).",
 )
 
 run_button = st.sidebar.button("Run analysis")
 
-
-# ------------------------------
-# Main logic (with caching)
-# ------------------------------
-
-@st.cache_data(show_spinner=True)
-def run_analysis_cached(
+# ---------------------------------------------------------
+# Helper to call your engine (no caching to keep it simple)
+# ---------------------------------------------------------
+def run_analysis(
     ticker: str,
     max_expiries: int,
     rate: float,
@@ -149,11 +159,13 @@ def run_analysis_cached(
     )
     return result
 
-
+# ---------------------------------------------------------
+# Main app body
+# ---------------------------------------------------------
 if run_button:
     with st.spinner("Fetching data and running analysis..."):
         try:
-            result = run_analysis_cached(
+            result = run_analysis(
                 ticker=ticker,
                 max_expiries=max_expiries,
                 rate=rate,
@@ -181,35 +193,47 @@ if run_button:
     unusual_df = result["unusual_df"]
     narrative = result["narrative"]
 
-    # ------------------------------
-    # Layout sections
-    # ------------------------------
     st.subheader(f"Overview for {ticker} (spot ≈ {spot:.2f})")
 
     col1, col2 = st.columns(2)
 
-    # --- Price & MAs chart ---
+    # -----------------------------------------------------
+    # Price & moving averages (robust to MultiIndex)
+    # -----------------------------------------------------
     with col1:
         st.markdown("**Price & Moving Averages (6M)**")
 
-        # Flatten MultiIndex if necessary
         price_plot = price_df.copy()
-        if isinstance(price_plot.columns, pd.MultiIndex):
-            price_plot.columns = ["_".join([str(c) for c in col]).strip("_") for col in price_plot.columns]
 
-        # Build a tidy frame for plotting
-        price_plot = price_plot[["Close", "SMA20", "SMA50", "SMA200"]]
-        price_plot = price_plot.rename(columns={"Close": "Price"})
+        # 1) Extract a 1-D close series regardless of MultiIndex/DataFrame
+        close_obj = price_plot["Close"]
+        if isinstance(close_obj, pd.DataFrame):
+            close_series = close_obj.iloc[:, 0]
+        else:
+            close_series = close_obj
+
+        # 2) Build plotting DataFrame
+        plot_df = pd.DataFrame(
+            {
+                "Date": price_plot.index,
+                "Price": close_series.values,
+                "SMA20": price_plot["SMA20"].values,
+                "SMA50": price_plot["SMA50"].values,
+                "SMA200": price_plot["SMA200"].values,
+            }
+        )
 
         fig_price = px.line(
-            price_plot.reset_index(),
+            plot_df,
             x="Date",
             y=["Price", "SMA20", "SMA50", "SMA200"],
             labels={"value": "Price", "variable": "Series"},
         )
         st.plotly_chart(fig_price, use_container_width=True)
 
-    # --- PCR & narrative ---
+    # -----------------------------------------------------
+    # Put/Call ratios & narrative
+    # -----------------------------------------------------
     with col2:
         st.markdown("**Put/Call Ratios & Narrative**")
 
@@ -217,13 +241,14 @@ if run_button:
         st.json(pcr_info["overall"])
 
         st.markdown("**Summary & Interpretation:**")
+        # Use text so it preserves line breaks nicely
         st.text(narrative)
 
     st.markdown("---")
 
-    # ------------------------------
+    # -----------------------------------------------------
     # Gamma exposure
-    # ------------------------------
+    # -----------------------------------------------------
     st.subheader("Gamma Exposure by Strike")
 
     if not gex_table.empty:
@@ -238,7 +263,12 @@ if run_button:
 
         st.dataframe(
             gex_table.sort_values("gex", ascending=True).tail(20).style.format(
-                {"gex": "{:,.0f}", "total_oi": "{:,.0f}", "call_oi": "{:,.0f}", "put_oi": "{:,.0f}"}
+                {
+                    "gex": "{:,.0f}",
+                    "total_oi": "{:,.0f}",
+                    "call_oi": "{:,.0f}",
+                    "put_oi": "{:,.0f}",
+                }
             ),
             use_container_width=True,
         )
@@ -247,15 +277,14 @@ if run_button:
 
     st.markdown("---")
 
-    # ------------------------------
-    # Unusual activity
-    # ------------------------------
+    # -----------------------------------------------------
+    # Unusual options activity
+    # -----------------------------------------------------
     st.subheader("Flagged Unusual Options Activity")
 
     if unusual_df.empty:
-        st.info("No contracts passed the advanced unusual-activity filters with current settings.")
+        st.info("No contracts passed the advanced unusual-activity filters with the current settings.")
     else:
-        # Small chart: notional by strike vs type
         fig_unusual = px.scatter(
             unusual_df,
             x="strike",
@@ -263,63 +292,4 @@ if run_button:
             color="type",
             size="dollar_notional",
             hover_data=["expiry", "dte", "delta_bucket", "reason"],
-            labels={"dollar_notional": "Notional ($)", "strike": "Strike"},
-            title="Unusual Trades by Strike and Notional",
-        )
-        st.plotly_chart(fig_unusual, use_container_width=True)
-
-        # Data table
-        st.dataframe(
-            unusual_df.head(200).style.format(
-                {
-                    "dollar_notional": "{:,.0f}",
-                    "volume": "{:,.0f}",
-                    "openInterest": "{:,.0f}",
-                    "vol_oi_ratio": "{:,.2f}",
-                    "iv": "{:.3f}",
-                    "delta": "{:.3f}",
-                    "gamma": "{:.3f}",
-                    "vega": "{:.3f}",
-                    "theta": "{:.3f}",
-                    "moneyness": "{:.3%}",
-                    "vol_vs_hist": "{:.2f}",
-                    "oi_change_ratio": "{:.2f}",
-                }
-            ),
-            use_container_width=True,
-        )
-
-    st.markdown("---")
-
-    # ------------------------------
-    # Clusters
-    # ------------------------------
-    st.subheader("Notional Clusters by Expiry & Moneyness")
-
-    if not clusters.empty:
-        st.dataframe(
-            clusters.head(50).style.format(
-                {
-                    "total_notional": "{:,.0f}",
-                    "call_notional": "{:,.0f}",
-                    "put_notional": "{:,.0f}",
-                    "net_call_minus_put": "{:,.0f}",
-                    "avg_moneyness": "{:.2%}",
-                }
-            ),
-            use_container_width=True,
-        )
-
-        fig_clusters = px.bar(
-            clusters.head(20),
-            x="moneyness_band",
-            y="total_notional",
-            color="expiry",
-            labels={"moneyness_band": "Moneyness band (% from spot)", "total_notional": "Total notional ($)"},
-            title="Top Notional Clusters (by expiry & moneyness band)",
-        )
-        st.plotly_chart(fig_clusters, use_container_width=True)
-    else:
-        st.info("No cluster information available.")
-else:
-    st.info("Set your parameters in the sidebar and click **Run analysis**.")
+            labels={"dollar_notional": "Notio_
