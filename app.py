@@ -1,4 +1,3 @@
-# app.py
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -6,13 +5,15 @@ import plotly.express as px
 from spx_options_flow_v2 import (
     run_full_analysis,
     UnusualConfig,
+    vol_complex_summary,
+    macro_tape_summary,
 )
 
 # ---------------------------------------------------------
 # Streamlit page config
 # ---------------------------------------------------------
 st.set_page_config(
-    page_title="Options Flow & Gamma Dashboard",
+    page_title="Options Flow & Gamma Dashboard (v2)",
     layout="wide",
 )
 
@@ -24,7 +25,8 @@ This app wraps your options-analysis engine in a simple UI:
 
 - Choose a ticker (SPY / QQQ / etc.)
 - Adjust how aggressive the **unusual activity** filters are
-- Inspect price, gamma walls, and flagged options flow
+- Inspect price, gamma walls, flagged options flow
+- Overlay **volatility regime** (VIX, RV vs IV, skew) and **macro tape** (rates, credit, dollar)
 """
 )
 
@@ -120,7 +122,7 @@ history_lookback = st.sidebar.number_input(
 run_button = st.sidebar.button("Run analysis")
 
 # ---------------------------------------------------------
-# Helper to call your engine (no caching to keep it simple)
+# Helper to call your engine
 # ---------------------------------------------------------
 def run_analysis(
     ticker: str,
@@ -158,6 +160,7 @@ def run_analysis(
         unusual_config=config,
     )
     return result
+
 
 # ---------------------------------------------------------
 # Main app body
@@ -205,14 +208,13 @@ if run_button:
 
         price_plot = price_df.copy()
 
-        # 1) Extract a 1-D close series regardless of MultiIndex/DataFrame
+        # Extract a 1-D close series regardless of MultiIndex/DataFrame
         close_obj = price_plot["Close"]
         if isinstance(close_obj, pd.DataFrame):
             close_series = close_obj.iloc[:, 0]
         else:
             close_series = close_obj
 
-        # 2) Build plotting DataFrame
         plot_df = pd.DataFrame(
             {
                 "Date": price_plot.index,
@@ -241,14 +243,175 @@ if run_button:
         st.json(pcr_info["overall"])
 
         st.markdown("**Summary & Interpretation:**")
-        # Use text so it preserves line breaks nicely
         st.text(narrative)
 
+    # -----------------------------------------------------
+    # Volatility Complex (Pillar 1)
+    # -----------------------------------------------------
     st.markdown("---")
+    st.subheader("Volatility Complex – Regime View")
+
+    vol_info = vol_complex_summary(price_df, chain_df)
+
+    rv20 = vol_info["rv20"]
+    atm_iv_30d = vol_info["atm_iv_30d"]
+    vix = vol_info["vix"]
+    vix3m = vol_info["vix3m"]
+    iv_rv_label = vol_info["iv_rv_label"]
+    vix_term_label = vol_info["vix_term_label"]
+    skew_label = vol_info["skew_label"]
+    vix_long = vol_info["vix_long_df"]
+
+    colv1, colv2 = st.columns([1, 2])
+
+    with colv1:
+        st.markdown("**Key metrics (approx 30D):**")
+        if rv20 is not None:
+            st.write(f"- 20D realized vol: **{rv20:.1f}%**")
+        else:
+            st.write("- 20D realized vol: *(insufficient data)*")
+
+        if atm_iv_30d is not None:
+            st.write(f"- 30D ATM implied vol: **{atm_iv_30d:.1f}%**")
+        else:
+            st.write("- 30D ATM implied vol: *(could not infer)*")
+
+        st.write(f"- IV vs RV: **{iv_rv_label}**")
+
+        if vix is not None:
+            st.write(f"- Spot VIX: **{vix:.1f}**")
+        if vix3m is not None:
+            st.write(f"- 3M VIX: **{vix3m:.1f}**")
+
+        st.write(f"- Term structure: **{vix_term_label}**")
+        st.write(f"- 30D skew (25Δ put – call): **{skew_label}**")
+
+        st.caption(
+            "Heuristic: IV >> RV + steep negative skew = rich downside protection "
+            "→ better for selling vol / being picky buying gamma. "
+            "IV ~ RV + mild skew = optionality relatively cheap."
+        )
+
+    with colv2:
+        # VIX term-structure chart
+        if vix_long is not None and not vix_long.empty:
+            fig_vix = px.line(
+                vix_long,
+                x="Date",
+                y="Level",
+                color="Index",
+                title="VIX Term Structure (6M)",
+                labels={"Level": "Index level"},
+            )
+            st.plotly_chart(fig_vix, use_container_width=True)
+
+        # IV vs RV bar chart
+        bars = []
+        vals = []
+        if rv20 is not None:
+            bars.append("20D Realized")
+            vals.append(rv20)
+        if atm_iv_30d is not None:
+            bars.append("30D ATM Implied")
+            vals.append(atm_iv_30d)
+
+        if bars:
+            iv_rv_df = pd.DataFrame({"Metric": bars, "Vol": vals})
+            fig_ivrv = px.bar(
+                iv_rv_df,
+                x="Metric",
+                y="Vol",
+                title="Realized vs Implied Vol (approx)",
+                labels={"Vol": "Annualized vol (%)"},
+            )
+            st.plotly_chart(fig_ivrv, use_container_width=True)
+
+    # -----------------------------------------------------
+    # Macro Tape – Rates, Credit, Dollar (Pillar 4)
+    # -----------------------------------------------------
+    st.markdown("---")
+    st.subheader("Macro Tape – Rates, Credit, Dollar (6M)")
+
+    macro = macro_tape_summary(period="6mo", interval="1d")
+    metrics = macro["metrics"]
+    yc_df = macro["yield_curve_df"]
+    credit_df = macro["credit_df"]
+    dollar_df = macro["dollar_df"]
+
+    colm1, colm2 = st.columns([1, 2])
+
+    with colm1:
+        st.markdown("**Summary:**")
+
+        rates = metrics.get("rates")
+        credit = metrics.get("credit")
+        dollar = metrics.get("dollar")
+
+        if rates:
+            st.write(
+                f"- 10Y: **{rates['last_10y']:.2f}%**, 3M: **{rates['last_3m']:.2f}%**, "
+                f"slope: **{rates['slope']:.2f}pp** → {rates['regime']}"
+            )
+        else:
+            st.write("- Rates: *(data unavailable)*")
+
+        if credit:
+            st.write(
+                f"- Credit (HYG/LQD): level **{credit['last_ratio']:.3f}**, "
+                f"z-score **{credit['zscore']:.2f}** → {credit['regime']}"
+            )
+        else:
+            st.write("- Credit: *(data unavailable)*")
+
+        if dollar:
+            st.write(
+                f"- Dollar (UUP): last **{dollar['last']:.2f}**, regime: {dollar['regime']}"
+            )
+        else:
+            st.write("- Dollar: *(data unavailable)*")
+
+        st.caption(
+            "Heuristic: deep curve inversion + credit risk-off + strong dollar "
+            "→ macro headwind for SPX. The opposite is macro tailwind."
+        )
+
+    with colm2:
+        # Yield curve plot
+        if yc_df is not None and not yc_df.empty:
+            fig_yc = px.line(
+                yc_df,
+                x="Date",
+                y="Yield",
+                color="Tenor",
+                title="US Yield Curve (10Y vs 3M)",
+                labels={"Yield": "Yield (%)"},
+            )
+            st.plotly_chart(fig_yc, use_container_width=True)
+
+        # Credit ratio plot
+        if credit_df is not None and not credit_df.empty:
+            fig_cr = px.line(
+                credit_df,
+                x="Date",
+                y="HYG/LQD",
+                title="Credit Risk Appetite (HYG/LQD)",
+            )
+            st.plotly_chart(fig_cr, use_container_width=True)
+
+        # Dollar trend plot
+        if dollar_df is not None and not dollar_df.empty:
+            fig_uup = px.line(
+                dollar_df,
+                x="Date",
+                y="UUP",
+                title="Dollar ETF (UUP)",
+            )
+            st.plotly_chart(fig_uup, use_container_width=True)
 
     # -----------------------------------------------------
     # Gamma exposure
     # -----------------------------------------------------
+    st.markdown("---")
     st.subheader("Gamma Exposure by Strike")
 
     if not gex_table.empty:
@@ -275,15 +438,16 @@ if run_button:
     else:
         st.info("No gamma exposure data available.")
 
-    st.markdown("---")
-
     # -----------------------------------------------------
     # Unusual options activity
     # -----------------------------------------------------
+    st.markdown("---")
     st.subheader("Flagged Unusual Options Activity")
 
     if unusual_df.empty:
-        st.info("No contracts passed the advanced unusual-activity filters with the current settings.")
+        st.info(
+            "No contracts passed the advanced unusual-activity filters with the current settings."
+        )
     else:
         fig_unusual = px.scatter(
             unusual_df,
@@ -317,11 +481,10 @@ if run_button:
             use_container_width=True,
         )
 
-    st.markdown("---")
-
     # -----------------------------------------------------
     # Notional clusters
     # -----------------------------------------------------
+    st.markdown("---")
     st.subheader("Notional Clusters by Expiry & Moneyness")
 
     if not clusters.empty:

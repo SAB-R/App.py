@@ -1,6 +1,8 @@
 """
-Options flow + gamma analysis engine for the Streamlit dashboard.
+Options flow + gamma analysis engine for the Streamlit dashboard (v2).
 
+Core features
+-------------
 - Fetches price history & adds moving averages
 - Downloads options chains for chosen expiries
 - Computes IV & Greeks (Black–Scholes)
@@ -12,7 +14,10 @@ Options flow + gamma analysis engine for the Streamlit dashboard.
 - Builds notional clusters
 - Produces a narrative summary
 
-Designed to work with the Streamlit app in app.py
+New in v2
+---------
+- Volatility complex helpers (realized vs implied vol, VIX term structure, skew)
+- Macro tape helpers (rates curve, credit, dollar)
 """
 
 from __future__ import annotations
@@ -918,6 +923,314 @@ def summarize_unusual_narrative(
 
 
 # ---------------------------------------------------------------------
+# Volatility complex (Pillar 1)
+# ---------------------------------------------------------------------
+
+
+def fetch_vix_series(period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
+    """
+    Fetch spot VIX and 3M VIX (^VIX3M) as a simple DataFrame of levels.
+    """
+    tickers = ["^VIX", "^VIX3M"]
+    df = yf.download(tickers, period=period, interval=interval, auto_adjust=False)
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df["Adj Close"].copy()
+    df = df.dropna(how="all")
+    return df
+
+
+def compute_realized_vol(price_df: pd.DataFrame, window: int = 20) -> Optional[float]:
+    """
+    Realized volatility over 'window' days (annualized, in %).
+    """
+    if "Close" not in price_df.columns:
+        return None
+    ret = price_df["Close"].pct_change()
+    if ret.shape[0] < window:
+        return None
+    rv = ret.rolling(window).std().iloc[-1] * np.sqrt(252.0)
+    if pd.isna(rv):
+        return None
+    return float(rv * 100.0)
+
+
+def compute_atm_iv_30d(chain_df: pd.DataFrame) -> Optional[float]:
+    """
+    Approximate 30D ATM implied vol (annualized, in %) from the options chain.
+    """
+    if chain_df is None or chain_df.empty or "iv" not in chain_df.columns:
+        return None
+
+    df = chain_df.copy()
+    if "dte" in df.columns:
+        near = df[(df["dte"] >= 20) & (df["dte"] <= 40)]
+    else:
+        near = df
+    if near.empty:
+        near = df
+
+    if "moneyness" in near.columns:
+        atm = near[near["moneyness"].abs() <= 0.01]
+    else:
+        atm = pd.DataFrame()
+
+    if atm.empty and "delta" in near.columns:
+        atm = near[near["delta"].abs().between(0.4, 0.6)]
+
+    if atm.empty:
+        return None
+
+    iv_atm = float(atm["iv"].median() * 100.0)
+    return iv_atm
+
+
+def compute_skew_30d(chain_df: pd.DataFrame) -> Optional[float]:
+    """
+    30D 25-delta put - 25-delta call skew (vol points).
+    """
+    if chain_df is None or chain_df.empty or "delta" not in chain_df.columns:
+        return None
+
+    df = chain_df.copy()
+    if "dte" in df.columns:
+        near = df[(df["dte"] >= 20) & (df["dte"] <= 40)]
+        if near.empty:
+            near = df
+    else:
+        near = df
+
+    puts_25 = near[(near["type"] == "put") & (near["delta"].between(-0.35, -0.15))]
+    calls_25 = near[(near["type"] == "call") & (near["delta"].between(0.15, 0.35))]
+
+    if puts_25.empty or calls_25.empty:
+        return None
+
+    iv_put = float(puts_25["iv"].median() * 100.0)
+    iv_call = float(calls_25["iv"].median() * 100.0)
+    return iv_put - iv_call
+
+
+def classify_iv_rv(iv: Optional[float], rv: Optional[float]) -> str:
+    if iv is None or rv is None or rv <= 0:
+        return "unknown"
+    ratio = iv / rv
+    if ratio >= 1.3:
+        return f"rich (IV/RV ≈ {ratio:.2f})"
+    if ratio <= 0.8:
+        return f"cheap (IV/RV ≈ {ratio:.2f})"
+    return f"fair (IV/RV ≈ {ratio:.2f})"
+
+
+def classify_vix_term(vix: Optional[float], vix3m: Optional[float]) -> str:
+    if vix is None or np.isnan(vix):
+        return "unknown"
+    if vix3m is None or np.isnan(vix3m):
+        return "no 3M VIX data"
+
+    slope = vix3m - vix
+    if slope >= 3.0:
+        regime = "calm contango"
+    elif slope >= 0.5:
+        regime = "normal contango"
+    elif slope >= -1.0:
+        regime = "flat / watch"
+    else:
+        regime = "backwardation (stress)"
+    return f"{regime} (3M–spot ≈ {slope:.1f} vol pts)"
+
+
+def classify_skew(skew: Optional[float]) -> str:
+    if skew is None:
+        return "unknown"
+    if skew <= -6:
+        return f"very steep (≈ {skew:.1f} vol pts)"
+    if skew <= -3:
+        return f"elevated (≈ {skew:.1f} vol pts)"
+    if skew <= 0:
+        return f"mild (≈ {skew:.1f} vol pts)"
+    return f"flat/inverted (≈ {skew:.1f} vol pts)"
+
+
+def vol_complex_summary(
+    price_df: pd.DataFrame,
+    chain_df: pd.DataFrame,
+    vix_period: str = "6mo",
+    vix_interval: str = "1d",
+) -> Dict[str, Any]:
+    """
+    High-level volatility regime summary + tidy VIX data for plotting.
+    """
+    rv20 = compute_realized_vol(price_df, window=20)
+    atm_iv_30d = compute_atm_iv_30d(chain_df)
+    skew_30d = compute_skew_30d(chain_df)
+
+    vix_df = fetch_vix_series(period=vix_period, interval=vix_interval)
+    vix = vix3m = None
+    if "^VIX" in vix_df.columns and not vix_df["^VIX"].dropna().empty:
+        vix = float(vix_df["^VIX"].dropna().iloc[-1])
+    if "^VIX3M" in vix_df.columns and not vix_df["^VIX3M"].dropna().empty:
+        vix3m = float(vix_df["^VIX3M"].dropna().iloc[-1])
+
+    iv_rv_label = classify_iv_rv(atm_iv_30d, rv20)
+    vix_term_label = classify_vix_term(vix, vix3m)
+    skew_label = classify_skew(skew_30d)
+
+    vix_long = None
+    if not vix_df.empty:
+        vix_long = vix_df.reset_index()
+        # first column is the date index
+        vix_long.rename(columns={vix_long.columns[0]: "Date"}, inplace=True)
+        vix_long = vix_long.melt(id_vars="Date", var_name="Index", value_name="Level")
+
+    return {
+        "rv20": rv20,
+        "atm_iv_30d": atm_iv_30d,
+        "skew_30d": skew_30d,
+        "vix": vix,
+        "vix3m": vix3m,
+        "iv_rv_label": iv_rv_label,
+        "vix_term_label": vix_term_label,
+        "skew_label": skew_label,
+        "vix_long_df": vix_long,
+    }
+
+
+# ---------------------------------------------------------------------
+# Macro tape (Pillar 4)
+# ---------------------------------------------------------------------
+
+
+def fetch_macro_series(period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
+    """
+    Fetch key macro tickers:
+    - ^TNX: 10Y US yield (x10)
+    - ^IRX: 13-week T-bill (x10)
+    - HYG, LQD: credit ETFs
+    - UUP: dollar ETF
+    """
+    tickers = ["^TNX", "^IRX", "HYG", "LQD", "UUP"]
+    df = yf.download(tickers, period=period, interval=interval, auto_adjust=False)
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df["Adj Close"].copy()
+    df = df.dropna(how="all")
+    return df
+
+
+def compute_macro_metrics(prices: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Compute last values & simple regime labels for:
+    - yield curve (10Y - 3M)
+    - credit (HYG/LQD)
+    - dollar (trend via 50d vs 200d)
+    """
+    out: Dict[str, Any] = {}
+
+    # Yields (note: ^TNX and ^IRX are yield*10, e.g. 45 = 4.5%)
+    if "^TNX" in prices.columns and "^IRX" in prices.columns:
+        tnx = prices["^TNX"].dropna()
+        irx = prices["^IRX"].dropna()
+        if not tnx.empty and not irx.empty:
+            last_10y = float(tnx.iloc[-1]) / 10.0
+            last_3m = float(irx.iloc[-1]) / 10.0
+            slope = last_10y - last_3m
+            if slope < -0.5:
+                curve_regime = "deep inversion (recession risk / restrictive)"
+            elif slope < 0:
+                curve_regime = "mild inversion"
+            elif slope < 1:
+                curve_regime = "flat / early steepening"
+            else:
+                curve_regime = "normal / steep"
+            out["rates"] = {
+                "last_10y": last_10y,
+                "last_3m": last_3m,
+                "slope": slope,
+                "regime": curve_regime,
+            }
+
+    # Credit: HYG / LQD
+    if "HYG" in prices.columns and "LQD" in prices.columns:
+        hyg = prices["HYG"]
+        lqd = prices["LQD"]
+        ratio = (hyg / lqd).dropna()
+        if not ratio.empty:
+            last_ratio = float(ratio.iloc[-1])
+            z = (last_ratio - ratio.mean()) / (ratio.std() + 1e-9)
+            if z >= 1:
+                credit_regime = "risk-on (HY outperforming IG)"
+            elif z <= -1:
+                credit_regime = "risk-off (HY underperforming)"
+            else:
+                credit_regime = "neutral"
+            out["credit"] = {
+                "last_ratio": last_ratio,
+                "zscore": float(z),
+                "regime": credit_regime,
+                "series": ratio,
+            }
+
+    # Dollar: UUP
+    if "UUP" in prices.columns:
+        uup = prices["UUP"].dropna()
+        if not uup.empty:
+            last = float(uup.iloc[-1])
+            ma50 = uup.rolling(50).mean().iloc[-1]
+            ma200 = uup.rolling(200).mean().iloc[-1]
+            if ma50 > ma200:
+                dollar_regime = "strong / uptrend"
+            else:
+                dollar_regime = "benign / downtrend"
+            out["dollar"] = {
+                "last": last,
+                "ma50": float(ma50),
+                "ma200": float(ma200),
+                "regime": dollar_regime,
+                "series": uup,
+            }
+
+    return out
+
+
+def macro_tape_summary(
+    period: str = "6mo",
+    interval: str = "1d",
+) -> Dict[str, Any]:
+    """
+    Convenience wrapper to fetch macro prices, compute metrics,
+    and build tidy DataFrames for plotting.
+    """
+    prices = fetch_macro_series(period=period, interval=interval)
+    metrics = compute_macro_metrics(prices)
+
+    yield_curve_df = None
+    if "^TNX" in prices.columns and "^IRX" in prices.columns:
+        yc = prices[["^TNX", "^IRX"]].copy() / 10.0  # convert to %
+        yc = yc.reset_index()
+        yc.rename(columns={yc.columns[0]: "Date", "^TNX": "10Y", "^IRX": "3M"}, inplace=True)
+        yield_curve_df = yc.melt(id_vars="Date", var_name="Tenor", value_name="Yield")
+
+    credit_df = None
+    if "credit" in metrics:
+        cr = metrics["credit"]["series"].reset_index()
+        cr.columns = ["Date", "HYG/LQD"]
+        credit_df = cr
+
+    dollar_df = None
+    if "dollar" in metrics:
+        du = metrics["dollar"]["series"].reset_index()
+        du.columns = ["Date", "UUP"]
+        dollar_df = du
+
+    return {
+        "prices": prices,
+        "metrics": metrics,
+        "yield_curve_df": yield_curve_df,
+        "credit_df": credit_df,
+        "dollar_df": dollar_df,
+    }
+
+
+# ---------------------------------------------------------------------
 # Top-level orchestrator
 # ---------------------------------------------------------------------
 
@@ -938,7 +1251,6 @@ def run_full_analysis(
 
     # 1) Price history
     price_df = get_price_history(ticker, period=price_period, interval=price_interval)
-    # spot = last close
     spot = float(price_df["Close"].iloc[-1])
 
     # 2) Expiries to analyse
@@ -963,7 +1275,9 @@ def run_full_analysis(
 
     # 4) History features
     history_df = load_history_snapshots(ticker, lookback_days=history_lookback_days)
-    chain_df = add_history_features(chain_df, history_df, lookback_days=min(20, history_lookback_days))
+    chain_df = add_history_features(
+        chain_df, history_df, lookback_days=min(20, history_lookback_days)
+    )
 
     # 5) Intraday percentiles
     chain_df["notional_pct"] = chain_df["dollar_notional"].rank(pct=True)
