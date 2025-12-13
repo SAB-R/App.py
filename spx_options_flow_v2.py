@@ -942,16 +942,34 @@ def fetch_vix_series(period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
 def compute_realized_vol(price_df: pd.DataFrame, window: int = 20) -> Optional[float]:
     """
     Realized volatility over 'window' days (annualized, in %).
+
+    Handles both 1-D Series and yfinance's MultiIndex/DataFrame 'Close'
+    by always collapsing to a single close series (first column).
     """
     if "Close" not in price_df.columns:
         return None
-    ret = price_df["Close"].pct_change()
+
+    close_obj = price_df["Close"]
+
+    # If yfinance returned a DataFrame (e.g. MultiIndex columns), take first column
+    if isinstance(close_obj, pd.DataFrame):
+        close = close_obj.iloc[:, 0]
+    else:
+        close = close_obj
+
+    close = close.astype(float)
+
+    ret = close.pct_change()
     if ret.shape[0] < window:
         return None
-    rv = ret.rolling(window).std().iloc[-1] * np.sqrt(252.0)
+
+    rv = ret.rolling(window).std().iloc[-1]
     if pd.isna(rv):
         return None
-    return float(rv * 100.0)
+
+    rv_annual = rv * np.sqrt(252.0)
+    return float(rv_annual * 100.0)
+
 
 
 def compute_atm_iv_30d(chain_df: pd.DataFrame) -> Optional[float]:
