@@ -384,7 +384,7 @@ def add_history_features(
     """
     df = today_chain.copy()
 
-    # Guarantee these columns exist, even if we return early
+    # Ensure these columns ALWAYS exist
     base_hist_cols = [
         "avg_volume_recent",
         "vol_vs_hist",
@@ -397,6 +397,7 @@ def add_history_features(
         if col not in df.columns:
             df[col] = np.nan
 
+    # If we have no usable history, just return with these NaNs
     if (
         history_df is None
         or history_df.empty
@@ -410,6 +411,7 @@ def add_history_features(
 
     end = pd.Timestamp.today().normalize()
     start = end - pd.Timedelta(days=lookback_days)
+
     h = history_df.copy()
     h["asof_date"] = pd.to_datetime(h["asof_date"]).dt.normalize()
     h = h[(h["asof_date"] >= start) & (h["asof_date"] < end)]
@@ -421,14 +423,14 @@ def add_history_features(
         )
         return df
 
-    # Average volume over lookback
+    # -------- avg volume over lookback --------
     vol_stats = (
         h.groupby("contractSymbol")
         .agg(avg_volume_recent=("volume", "mean"))
         .reset_index()
     )
 
-    # IV rank over lookback per contract
+    # -------- IV rank over lookback per contract --------
     h = h.sort_values(["contractSymbol", "asof_date"])
     h["iv_rank_recent"] = h.groupby("contractSymbol")["iv"].rank(pct=True)
     iv_stats = (
@@ -450,6 +452,7 @@ def add_history_features(
     h_yday = history_df.copy()
     h_yday["asof_date"] = pd.to_datetime(h_yday["asof_date"]).dt.normalize()
     h_yday = h_yday[h_yday["asof_date"] == yday]
+
     if not h_yday.empty:
         oi_prev = h_yday[["contractSymbol", "openInterest"]].rename(
             columns={"openInterest": "openInterest_prev"}
@@ -462,6 +465,7 @@ def add_history_features(
     )
 
     return df
+
 
 
 # ---------------------------------------------------------------------
@@ -623,10 +627,11 @@ def flag_unusual_activity_advanced(
 ) -> pd.DataFrame:
     """
     Use intraday percentiles + history-based metrics to flag unusual lines.
+    Safe even when history-based columns are missing (first run).
     """
     df = chain.copy()
 
-    # Ensure history fields exist & fill NaN with 0 for logic
+    # Defensive: if any of these columns are missing, create them with 0
     for col in ["avg_volume_recent", "vol_vs_hist", "iv_rank_recent", "oi_change_ratio"]:
         if col not in df.columns:
             df[col] = 0.0
