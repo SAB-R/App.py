@@ -152,16 +152,67 @@ def get_options_chain(
 ) -> pd.DataFrame:
     """
     Download options chain for selected expiries and compute greeks.
-    Uses yfinance's impliedVolatility when available.
+
+    Robust version:
+      - Normalizes ticker string.
+      - If no options are available for index tickers like ^SPX/SPX,
+        automatically falls back to SPY for the options surface.
     """
-    t = yf.Ticker(ticker)
-    chosen_exp = _select_expiries(ticker, expiries, max_expiries)
+    # ------------------------------------------------------------------
+    # 1) Normalize ticker and decide which symbol to use for options
+    # ------------------------------------------------------------------
+    ticker_clean = ticker.strip().upper()
+    options_ticker = ticker_clean
+
+    # Symbols where we likely want to use SPY options instead
+    index_aliases_for_spx = {"^SPX", "SPX", "US500", "SPX500", "SPXUSD"}
+
+    t = yf.Ticker(options_ticker)
+    all_exp = list(getattr(t, "options", []))
+
+    # If nothing, and this looks like an S&P index, try SPY automatically
+    if not all_exp and ticker_clean in index_aliases_for_spx:
+        options_ticker = "SPY"
+        t = yf.Ticker(options_ticker)
+        all_exp = list(getattr(t, "options", []))
+
+    if not all_exp:
+        # Still nothing – give a clear error
+        raise RuntimeError(
+            f"No options expiries available for {ticker_clean}. "
+            "If this is an index, try using the ETF (e.g. SPY for S&P 500, "
+            "QQQ for Nasdaq)."
+        )
+
+    # ------------------------------------------------------------------
+    # 2) Choose expiries
+    # ------------------------------------------------------------------
+    if expiries:
+        chosen_exp = list(expiries)[:max_expiries]
+    else:
+        chosen_exp = list(all_exp)[:max_expiries]
+
     if not chosen_exp:
-        raise RuntimeError(f"No options expiries available for {ticker}")
+        raise RuntimeError(
+            f"No usable expiries for options ticker {options_ticker}."
+        )
+
+    # ------------------------------------------------------------------
+    # 3) Get spot for the *price* ticker (what user typed), but use
+    #    options_ticker for the chain itself.
+    # ------------------------------------------------------------------
+    t_price = yf.Ticker(ticker_clean)
+    hist = t_price.history(period="1d")
+    if hist.empty:
+        # fall back to options_ticker price if necessary
+        hist = yf.Ticker(options_ticker).history(period="1d")
+    if hist.empty:
+        raise RuntimeError(f"Could not fetch price history for {ticker_clean}.")
+
+    spot = float(hist["Close"].iloc[-1])
+    today = dt.date.today()
 
     rows: List[Dict[str, Any]] = []
-    spot = float(t.history(period="1d")["Close"].iloc[-1])
-    today = dt.date.today()
 
     for exp_str in chosen_exp:
         opt = t.option_chain(exp_str)
@@ -170,15 +221,16 @@ def get_options_chain(
         for opt_type, df_side in (("call", opt.calls), ("put", opt.puts)):
             if df_side.empty:
                 continue
+
             for _, row in df_side.iterrows():
                 strike = float(row["strike"])
                 dte = (expiry - today).days
                 time = max(dte, 0) / 365.0
 
-                # Price proxy: mid of bid/ask if possible, else lastPrice
                 bid = float(row.get("bid", np.nan))
                 ask = float(row.get("ask", np.nan))
                 last = float(row.get("lastPrice", np.nan))
+
                 if not math.isnan(bid) and not math.isnan(ask) and ask > 0:
                     price_used = 0.5 * (bid + ask)
                 elif not math.isnan(last):
@@ -188,8 +240,8 @@ def get_options_chain(
 
                 iv_raw = float(row.get("impliedVolatility", np.nan))
                 if math.isnan(iv_raw) or iv_raw <= 0:
-                    # Fallback if missing – rough 20%
-                    iv_raw = 0.20
+                    iv_raw = 0.20  # simple fallback
+
                 vol = iv_raw  # 0.xx
 
                 greeks = bs_greeks(
@@ -207,6 +259,8 @@ def get_options_chain(
 
                 rows.append(
                     {
+                        "options_underlying": options_ticker,
+                        "price_underlying": ticker_clean,
                         "contractSymbol": row.get("contractSymbol"),
                         "type": opt_type,
                         "expiry": expiry,
@@ -218,7 +272,7 @@ def get_options_chain(
                         "price_used": price_used,
                         "volume": volume,
                         "openInterest": open_interest,
-                        "iv": iv_raw * 100.0,  # store in %
+                        "iv": iv_raw * 100.0,  # store IV in %
                         "delta": greeks["delta"],
                         "gamma": greeks["gamma"],
                         "vega": greeks["vega"],
@@ -228,11 +282,14 @@ def get_options_chain(
 
     chain = pd.DataFrame(rows)
     if chain.empty:
-        raise RuntimeError("No options data loaded")
+        raise RuntimeError(
+            f"Options chain for {options_ticker} came back empty."
+        )
 
     chain["moneyness"] = chain["strike"] / spot - 1.0
     chain["dollar_notional"] = chain["price_used"].fillna(0.0) * chain["volume"] * 100.0
     chain["vol_oi_ratio"] = chain["volume"] / chain["openInterest"].replace(0, np.nan)
+
     return chain
 
 
