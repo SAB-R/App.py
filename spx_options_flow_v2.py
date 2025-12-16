@@ -742,6 +742,295 @@ def build_narrative(
 # Orchestrator
 # ---------------------------------------------------------------------
 
+# =====================================================================
+# Volatility Complex – regime view helpers
+# Re-introduces vol_complex_summary so app.py can import it.
+# =====================================================================
+
+def compute_realized_vol(price_df: pd.DataFrame, window: int = 20) -> float:
+    """
+    20D realized volatility (annualized, in %), based on log returns.
+    """
+    close = price_df["Close"].dropna()
+    if close.shape[0] <= window:
+        return float("nan")
+
+    rets = np.log(close).diff().dropna()
+    rv = rets.rolling(window).std().iloc[-1] * math.sqrt(252.0) * 100.0
+    return float(rv)
+
+
+def compute_atm_iv_30d(chain_df: pd.DataFrame, spot: float) -> float:
+    """
+    30D-ish ATM implied vol (in %), using the same machinery
+    as compute_implied_distribution.
+    """
+    info = compute_implied_distribution(chain_df, spot, target_dte=30)
+    if not info:
+        return float("nan")
+    atm_iv = info.get("atm_iv", np.nan)
+    return float(atm_iv) if atm_iv is not None else float("nan")
+
+
+def compute_skew_30d(chain_df: pd.DataFrame, spot: float) -> float:
+    """
+    30D skew ≈ (25Δ put IV – 25Δ call IV), in vol points.
+    """
+    ref_expiry = pick_reference_expiry(chain_df, target_dte=30)
+    if ref_expiry is None:
+        return float("nan")
+
+    df = chain_df.copy()
+    df["expiry"] = pd.to_datetime(df["expiry"])
+    g = df[df["expiry"] == ref_expiry]
+    if g.empty:
+        return float("nan")
+
+    put25_iv = _find_delta_option(g, "put", target_delta=-0.25)
+    call25_iv = _find_delta_option(g, "call", target_delta=0.25)
+    if put25_iv is None or call25_iv is None:
+        return float("nan")
+
+    return float(put25_iv - call25_iv)
+
+
+def fetch_vix_term_structure(period: str = "6mo") -> pd.DataFrame:
+    """
+    Fetch ^VIX and ^VIX3M history for the regime view.
+    Returns DataFrame indexed by date with columns '^VIX' and '^VIX3M'.
+    """
+    tickers = ["^VIX", "^VIX3M"]
+    raw = yf.download(tickers, period=period, interval="1d", auto_adjust=False)
+    if raw.empty:
+        return pd.DataFrame()
+
+    # Handle multi-index columns from yfinance
+    if isinstance(raw.columns, pd.MultiIndex):
+        adj = raw.xs("Adj Close", axis=1, level=0, drop_level=True)
+    else:
+        adj = raw[["Adj Close"]]
+
+    df = adj.copy()
+    # ensure column names contain the tickers for the existing plotting code
+    col_map = {}
+    for c in df.columns:
+        if "VIX3M" in str(c):
+            col_map[c] = "^VIX3M"
+        elif "VIX" in str(c):
+            col_map[c] = "^VIX"
+    if col_map:
+        df = df.rename(columns=col_map)
+
+    return df.dropna(how="all")
+
+
+def fetch_yield_curve(period: str = "6mo") -> pd.DataFrame:
+    """
+    Fetch 10Y (^TNX) and 3M (^IRX) yields from yfinance.
+    Returns DataFrame with columns ['10Y', '3M', 'slope'] in %.
+    """
+    raw = yf.download(["^TNX", "^IRX"], period=period, interval="1d", auto_adjust=False)
+    if raw.empty:
+        return pd.DataFrame()
+
+    if isinstance(raw.columns, pd.MultiIndex):
+        adj = raw.xs("Adj Close", axis=1, level=0, drop_level=True)
+    else:
+        adj = raw[["Adj Close"]]
+
+    df = adj.copy()
+    col_map = {}
+    for c in df.columns:
+        name = str(c)
+        if "TNX" in name:
+            col_map[c] = "10Y"
+        elif "IRX" in name:
+            col_map[c] = "3M"
+    df = df.rename(columns=col_map)
+
+    if "10Y" not in df.columns or "3M" not in df.columns:
+        return pd.DataFrame()
+
+    # yfinance gives yields in % pts already
+    df["slope"] = df["10Y"] - df["3M"]
+    return df.dropna(how="any")
+
+
+def fetch_credit_series(period: str = "6mo") -> tuple[pd.DataFrame, float, float]:
+    """
+    Credit risk appetite via HYG/LQD.
+    Returns (df, last_level, last_zscore).
+    """
+    raw = yf.download(["HYG", "LQD"], period=period, interval="1d", auto_adjust=False)
+    if raw.empty:
+        return pd.DataFrame(), float("nan"), float("nan")
+
+    if isinstance(raw.columns, pd.MultiIndex):
+        adj = raw.xs("Adj Close", axis=1, level=0, drop_level=True)
+    else:
+        adj = raw[["Adj Close"]]
+
+    df = adj.copy()
+    col_map = {}
+    for c in df.columns:
+        name = str(c)
+        if "HYG" in name:
+            col_map[c] = "HYG"
+        elif "LQD" in name:
+            col_map[c] = "LQD"
+    if col_map:
+        df = df.rename(columns=col_map)
+
+    if "HYG" not in df.columns or "LQD" not in df.columns:
+        return pd.DataFrame(), float("nan"), float("nan")
+
+    ratio = (df["HYG"] / df["LQD"]).rename("HYG_LQD")
+    out = ratio.to_frame()
+    level = float(ratio.iloc[-1])
+
+    if ratio.std(ddof=0) > 0:
+        z = (ratio - ratio.mean()) / ratio.std(ddof=0)
+        z_last = float(z.iloc[-1])
+        out["z"] = z
+    else:
+        z_last = float("nan")
+        out["z"] = np.nan
+
+    return out, level, z_last
+
+
+def fetch_dollar_series(period: str = "6mo") -> tuple[pd.DataFrame, float, str]:
+    """
+    Dollar via UUP ETF. Returns (df, last_level, regime_label).
+    """
+    raw = yf.download("UUP", period=period, interval="1d", auto_adjust=False)
+    if raw.empty:
+        return pd.DataFrame(), float("nan"), "n/a"
+
+    if isinstance(raw.columns, pd.MultiIndex):
+        adj = raw.xs("Adj Close", axis=1, level=0, drop_level=True)
+        if isinstance(adj, pd.DataFrame):
+            s = adj.iloc[:, 0]
+        else:
+            s = adj
+    else:
+        s = raw["Adj Close"]
+
+    df = s.to_frame(name="UUP")
+    last = float(df["UUP"].iloc[-1])
+
+    # very simple trend label over last ~60 trading days
+    if len(df) > 20:
+        window = min(60, len(df))
+        s_slice = df["UUP"].iloc[-window:]
+        slope = float(s_slice.iloc[-1] - s_slice.iloc[0])
+    else:
+        slope = float(df["UUP"].iloc[-1] - df["UUP"].iloc[0])
+
+    if slope > 0:
+        regime = "uptrend / stronger dollar"
+    elif slope < 0:
+        regime = "downtrend / benign dollar"
+    else:
+        regime = "flat / neutral"
+
+    return df, last, regime
+
+
+def vol_complex_summary(price_df: pd.DataFrame,
+                        chain_df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    High-level volatility regime summary + tidy data for the 'Volatility
+    Complex – Regime View' page in the app.
+
+    Returns a dict with:
+      - rv20, atm_iv_30d, iv_rv_ratio, iv_vs_rv_label, skew_30d
+      - vix_df, spot_vix, spot_vix3m, term_structure_label
+      - yield_curve_df, yc_10y, yc_3m, yc_slope
+      - credit_df, credit_level, credit_z
+      - uup_df, uup_last, uup_regime
+    """
+    spot = float(price_df["Close"].iloc[-1])
+
+    rv20 = compute_realized_vol(price_df, window=20)
+    atm_iv_30d = compute_atm_iv_30d(chain_df, spot)
+    skew_30d = compute_skew_30d(chain_df, spot)
+
+    iv_rv_ratio = (
+        float(atm_iv_30d / rv20)
+        if rv20 and not math.isnan(rv20) and rv20 != 0
+        else float("nan")
+    )
+
+    if math.isnan(iv_rv_ratio):
+        iv_label = "n/a"
+    elif iv_rv_ratio > 1.15:
+        iv_label = "rich (IV >> RV)"
+    elif iv_rv_ratio < 0.85:
+        iv_label = "cheap (IV << RV)"
+    else:
+        iv_label = "fair (IV/RV ≈ 1)"
+
+    # VIX term structure
+    vix_df = fetch_vix_term_structure(period="6mo")
+    if not vix_df.empty:
+        spot_vix = float(vix_df.iloc[-1].get("^VIX", np.nan))
+        spot_vix3m = float(vix_df.iloc[-1].get("^VIX3M", np.nan))
+    else:
+        spot_vix = float("nan")
+        spot_vix3m = float("nan")
+
+    term_label = "n/a"
+    if not math.isnan(spot_vix) and not math.isnan(spot_vix3m):
+        spread = spot_vix3m - spot_vix
+        if spread > 3.0:
+            term_label = "calm contango"
+        elif spread > 1.0:
+            term_label = "mild contango"
+        elif spread > -1.0:
+            term_label = "flat"
+        else:
+            term_label = "backwardation / stress"
+
+    # Yield curve
+    yc_df = fetch_yield_curve(period="6mo")
+    if not yc_df.empty:
+        yc_10y = float(yc_df["10Y"].iloc[-1])
+        yc_3m = float(yc_df["3M"].iloc[-1])
+        yc_slope = float(yc_df["slope"].iloc[-1])
+    else:
+        yc_10y = yc_3m = yc_slope = float("nan")
+
+    # Credit
+    credit_df, credit_level, credit_z = fetch_credit_series(period="6mo")
+
+    # Dollar
+    uup_df, uup_last, uup_regime = fetch_dollar_series(period="6mo")
+
+    return {
+        "rv20": rv20,
+        "atm_iv_30d": atm_iv_30d,
+        "iv_rv_ratio": iv_rv_ratio,
+        "iv_vs_rv_label": iv_label,
+        "skew_30d": skew_30d,
+        "vix_df": vix_df,
+        "spot_vix": spot_vix,
+        "spot_vix3m": spot_vix3m,
+        "term_structure_label": term_label,
+        "yield_curve_df": yc_df,
+        "yc_10y": yc_10y,
+        "yc_3m": yc_3m,
+        "yc_slope": yc_slope,
+        "credit_df": credit_df,
+        "credit_level": credit_level,
+        "credit_z": credit_z,
+        "uup_df": uup_df,
+        "uup_last": uup_last,
+        "uup_regime": uup_regime,
+    }
+
+
+
 
 def run_full_analysis(
     ticker: str,
