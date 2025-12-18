@@ -1,390 +1,342 @@
-"""
-Options flow + gamma + volatility analytics engine for the Streamlit dashboard.
-
-Stage 2 version: includes
-- price history with moving averages
-- options chain download (yfinance) with Greeks
-- gamma exposure (GEX) / zero-gamma / walls
-- put/call ratios
-- unusual options activity (intraday, percentile-based)
-- notional clusters by expiry & moneyness band
-- implied distribution / expected moves from ATM IV
-- per-expiry vol surface snapshot (ATM, 25Δ RR & butterfly) with simple history
-
-External API:
-    - UnusualConfig dataclass
-    - run_full_analysis(...)
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import datetime as dt
 import math
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
 
-# ---------------------------------------------------------------------
-# Basic math helpers
-# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Core data-fetch helpers
+# ---------------------------------------------------------------------------
 
 
-def _norm_pdf(x: float) -> float:
-    return (1.0 / math.sqrt(2.0 * math.pi)) * math.exp(-0.5 * x * x)
+def get_price_history(
+    ticker: str,
+    period: str = "6mo",
+    interval: str = "1d",
+) -> pd.DataFrame:
+    """
+    Download underlying price history and add simple moving averages.
+    Returns a DataFrame indexed by date with at least: Open, High, Low, Close, Volume,
+    plus SMA20 / SMA50 / SMA200.
+    """
+    df = yf.download(ticker, period=period, interval=interval, auto_adjust=False)
+
+    if df.empty:
+        return pd.DataFrame()
+
+    # Some yfinance versions return a multi-index with "Adj Close"
+    if isinstance(df.columns, pd.MultiIndex):
+        wanted = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
+        cols = [c for c in df.columns if c[0] in wanted]
+        df = df[cols]
+        df.columns = [c[0] for c in df.columns]
+
+    for col in ["Open", "High", "Low", "Close"]:
+        if col not in df.columns:
+            raise ValueError(f"Missing {col} in price history for {ticker}")
+
+    close = df["Close"]
+    df["SMA20"] = close.rolling(window=20, min_periods=1).mean()
+    df["SMA50"] = close.rolling(window=50, min_periods=1).mean()
+    df["SMA200"] = close.rolling(window=200, min_periods=1).mean()
+
+    return df
+
+
+def list_option_expiries(ticker: str) -> List[str]:
+    tk = yf.Ticker(ticker)
+    return list(getattr(tk, "options", []) or [])
+
+
+def fetch_option_chain(
+    ticker: str,
+    expiries: Optional[Sequence[str]] = None,
+    max_expiries: int = 3,
+) -> pd.DataFrame:
+    """
+    Fetch option chains for the requested expiries and return a single tidy DataFrame.
+    """
+    tk = yf.Ticker(ticker)
+    all_exps: List[str] = list(getattr(tk, "options", []) or [])
+
+    if not all_exps:
+        return pd.DataFrame()
+
+    if expiries is None:
+        expiries = all_exps[:max_expiries]
+    else:
+        # keep only those that actually exist
+        expiries = [e for e in expiries if e in all_exps]
+        if not expiries:
+            raise ValueError(f"No expiries available for {ticker}")
+
+    frames: List[pd.DataFrame] = []
+
+    for exp in expiries:
+        chain = tk.option_chain(exp)
+        for opt_type, df_part in (("call", chain.calls), ("put", chain.puts)):
+            if df_part is None or df_part.empty:
+                continue
+            df_tmp = df_part.copy()
+            df_tmp["type"] = opt_type
+            df_tmp["expiry"] = pd.to_datetime(exp)
+            frames.append(df_tmp)
+
+    if not frames:
+        return pd.DataFrame()
+
+    chain_df = pd.concat(frames, ignore_index=True)
+
+    # Make sure key columns exist
+    for col in ["volume", "openInterest"]:
+        if col not in chain_df.columns:
+            chain_df[col] = 0
+
+    if "impliedVolatility" not in chain_df.columns:
+        chain_df["impliedVolatility"] = np.nan
+
+    if "strike" not in chain_df.columns:
+        raise ValueError("Option chain missing strike column")
+
+    # DTE
+    today = datetime.now(timezone.utc).date()
+    chain_df["expiry"] = pd.to_datetime(chain_df["expiry"]).dt.date
+    chain_df["dte"] = (
+        pd.to_datetime(chain_df["expiry"]) - pd.Timestamp(today)
+    ).dt.days.clip(lower=0)
+
+    # Mid price (fallback to lastPrice if bid/ask missing)
+    def _mid(row):
+        b = row.get("bid", np.nan)
+        a = row.get("ask", np.nan)
+        lp = row.get("lastPrice", np.nan)
+        if not math.isnan(b) and not math.isnan(a) and (a - b) >= 0:
+            return 0.5 * (a + b)
+        if not math.isnan(lp):
+            return lp
+        return max(b, a) if not (math.isnan(b) and math.isnan(a)) else np.nan
+
+    chain_df["price_used"] = chain_df.apply(_mid, axis=1)
+
+    return chain_df
+
+
+# ---------------------------------------------------------------------------
+# Black–Scholes greeks
+# ---------------------------------------------------------------------------
+
+
+def _bs_d1_d2(S: float, K: float, T: float, r: float, q: float, sigma: float) -> Tuple[float, float]:
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return float("nan"), float("nan")
+    num = math.log(S / K) + (r - q + 0.5 * sigma * sigma) * T
+    den = sigma * math.sqrt(T)
+    d1 = num / den
+    d2 = d1 - sigma * math.sqrt(T)
+    return d1, d2
 
 
 def _norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
-# ---------------------------------------------------------------------
-# Black–Scholes greeks
-# ---------------------------------------------------------------------
-
-
-def bs_greeks(
-    spot: float,
-    strike: float,
-    time: float,
-    rate: float,
-    div_yield: float,
-    vol: float,
-    is_call: bool,
-) -> Dict[str, float]:
+def black_scholes_greeks(
+    S: float,
+    K: float,
+    T: float,
+    r: float,
+    q: float,
+    sigma: float,
+    option_type: str,
+) -> Tuple[float, float, float, float]:
     """
-    Black–Scholes greeks for a European option.
-
-    time: in years
-    vol: annualized volatility (e.g. 0.20 for 20%)
+    Return (delta, gamma, vega, theta_annual) for a call or put.
+    Theta is per year; we'll divide by 365 later if we want per-day.
     """
-    if time <= 0 or vol <= 0 or spot <= 0 or strike <= 0:
-        return {"delta": 0.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0}
+    d1, d2 = _bs_d1_d2(S, K, T, r, q, sigma)
+    if math.isnan(d1):
+        return float("nan"), 0.0, 0.0, 0.0
 
-    sqrt_t = math.sqrt(time)
-    d1 = (math.log(spot / strike) + (rate - div_yield + 0.5 * vol * vol) * time) / (
-        vol * sqrt_t
-    )
-    d2 = d1 - vol * sqrt_t
-    disc_q = math.exp(-div_yield * time)
-    disc_r = math.exp(-rate * time)
+    phi_d1 = 1.0 / math.sqrt(2.0 * math.pi) * math.exp(-0.5 * d1 * d1)
 
-    pdf_d1 = _norm_pdf(d1)
+    if option_type == "call":
+        delta = math.exp(-q * T) * _norm_cdf(d1)
+    else:
+        delta = -math.exp(-q * T) * _norm_cdf(-d1)
 
-    if is_call:
-        delta = disc_q * _norm_cdf(d1)
+    gamma = math.exp(-q * T) * phi_d1 / (S * sigma * math.sqrt(T))
+    vega = S * math.exp(-q * T) * phi_d1 * math.sqrt(T) / 100.0  # per 1 vol point
+
+    if option_type == "call":
         theta = (
-            -disc_q * spot * pdf_d1 * vol / (2 * sqrt_t)
-            - rate * disc_r * strike * _norm_cdf(d2)
-            + div_yield * disc_q * spot * _norm_cdf(d1)
+            -0.5 * S * math.exp(-q * T) * phi_d1 * sigma / math.sqrt(T)
+            - r * math.exp(-r * T) * K * _norm_cdf(d2)
+            + q * math.exp(-q * T) * S * _norm_cdf(d1)
         )
     else:
-        delta = -disc_q * _norm_cdf(-d1)
         theta = (
-            -disc_q * spot * pdf_d1 * vol / (2 * sqrt_t)
-            + rate * disc_r * strike * _norm_cdf(-d2)
-            - div_yield * disc_q * spot * _norm_cdf(-d1)
+            -0.5 * S * math.exp(-q * T) * phi_d1 * sigma / math.sqrt(T)
+            + r * math.exp(-r * T) * K * _norm_cdf(-d2)
+            - q * math.exp(-q * T) * S * _norm_cdf(-d1)
         )
-
-    gamma = disc_q * pdf_d1 / (spot * vol * sqrt_t)
-    vega = disc_q * spot * pdf_d1 * sqrt_t  # per 1.0 vol (not %)
-
-    return {
-        "delta": float(delta),
-        "gamma": float(gamma),
-        "vega": float(vega),
-        "theta": float(theta),
-    }
+    return delta, gamma, vega, theta
 
 
-# ---------------------------------------------------------------------
-# Price history
-# ---------------------------------------------------------------------
-
-
-def get_price_history(
-    ticker: str, period: str = "6mo", interval: str = "1d"
-) -> pd.DataFrame:
-    """
-    Download OHLCV history from yfinance and compute moving averages.
-    """
-    data = yf.download(ticker, period=period, interval=interval, auto_adjust=False)
-    if data.empty:
-        raise RuntimeError(f"No price data for {ticker}")
-
-    df = data.copy()
-    df["SMA20"] = df["Close"].rolling(20).mean()
-    df["SMA50"] = df["Close"].rolling(50).mean()
-    df["SMA200"] = df["Close"].rolling(200).mean()
-    return df
-
-
-# ---------------------------------------------------------------------
-# Options chain download & greeks
-# ---------------------------------------------------------------------
-
-
-def _all_expiries(ticker: str) -> List[str]:
-    t = yf.Ticker(ticker)
-    return list(t.options)
-
-
-def _select_expiries(
-    ticker: str, expiries: Optional[Sequence[str]], max_expiries: int
-) -> List[str]:
-    if expiries:
-        return list(expiries)[:max_expiries]
-    all_exp = _all_expiries(ticker)
-    return all_exp[:max_expiries]
-
-
-def get_options_chain(
-    ticker: str,
-    expiries: Optional[Sequence[str]] = None,
-    max_expiries: int = 3,
+def enrich_with_greeks(
+    chain_df: pd.DataFrame,
+    spot: float,
     rate: float = 0.04,
     dividend_yield: float = 0.012,
 ) -> pd.DataFrame:
-    """
-    Download options chain for selected expiries and compute greeks.
+    if chain_df.empty:
+        return chain_df
 
-    Robust version:
-      - Normalizes ticker string.
-      - If no options are available for index tickers like ^SPX/SPX,
-        automatically falls back to SPY for the options surface.
-    """
-    # ------------------------------------------------------------------
-    # 1) Normalize ticker and decide which symbol to use for options
-    # ------------------------------------------------------------------
-    ticker_clean = ticker.strip().upper()
-    options_ticker = ticker_clean
+    df = chain_df.copy()
+    df["iv"] = df["impliedVolatility"].astype(float).clip(lower=1e-4, upper=5.0)
 
-    # Symbols where we likely want to use SPY options instead
-    index_aliases_for_spx = {"^SPX", "SPX", "US500", "SPX500", "SPXUSD"}
+    # Time to expiry in years
+    df["T"] = df["dte"].astype(float) / 365.0
 
-    t = yf.Ticker(options_ticker)
-    all_exp = list(getattr(t, "options", []))
+    deltas = []
+    gammas = []
+    vegas = []
+    thetas = []
 
-    # If nothing, and this looks like an S&P index, try SPY automatically
-    if not all_exp and ticker_clean in index_aliases_for_spx:
-        options_ticker = "SPY"
-        t = yf.Ticker(options_ticker)
-        all_exp = list(getattr(t, "options", []))
-
-    if not all_exp:
-        # Still nothing – give a clear error
-        raise RuntimeError(
-            f"No options expiries available for {ticker_clean}. "
-            "If this is an index, try using the ETF (e.g. SPY for S&P 500, "
-            "QQQ for Nasdaq)."
+    for _, row in df.iterrows():
+        S = float(spot)
+        K = float(row["strike"])
+        T = float(row["T"])
+        sigma = float(row["iv"])
+        if T <= 0 or sigma <= 0:
+            deltas.append(0.0)
+            gammas.append(0.0)
+            vegas.append(0.0)
+            thetas.append(0.0)
+            continue
+        d, g, v, th = black_scholes_greeks(
+            S=S,
+            K=K,
+            T=T,
+            r=rate,
+            q=dividend_yield,
+            sigma=sigma,
+            option_type=row["type"],
         )
+        deltas.append(d)
+        gammas.append(g)
+        thetas.append(th / 365.0)  # per day
+        vegas.append(v)
 
-    # ------------------------------------------------------------------
-    # 2) Choose expiries
-    # ------------------------------------------------------------------
-    if expiries:
-        chosen_exp = list(expiries)[:max_expiries]
-    else:
-        chosen_exp = list(all_exp)[:max_expiries]
+    df["delta"] = deltas
+    df["gamma"] = gammas
+    df["vega"] = vegas
+    df["theta"] = thetas
 
-    if not chosen_exp:
-        raise RuntimeError(
-            f"No usable expiries for options ticker {options_ticker}."
-        )
-
-    # ------------------------------------------------------------------
-    # 3) Get spot for the *price* ticker (what user typed), but use
-    #    options_ticker for the chain itself.
-    # ------------------------------------------------------------------
-    t_price = yf.Ticker(ticker_clean)
-    hist = t_price.history(period="1d")
-    if hist.empty:
-        # fall back to options_ticker price if necessary
-        hist = yf.Ticker(options_ticker).history(period="1d")
-    if hist.empty:
-        raise RuntimeError(f"Could not fetch price history for {ticker_clean}.")
-
-    spot = float(hist["Close"].iloc[-1])
-    today = dt.date.today()
-
-    rows: List[Dict[str, Any]] = []
-
-    for exp_str in chosen_exp:
-        opt = t.option_chain(exp_str)
-        expiry = dt.datetime.strptime(exp_str, "%Y-%m-%d").date()
-
-        for opt_type, df_side in (("call", opt.calls), ("put", opt.puts)):
-            if df_side.empty:
-                continue
-
-            for _, row in df_side.iterrows():
-                strike = float(row["strike"])
-                dte = (expiry - today).days
-                time = max(dte, 0) / 365.0
-
-                bid = float(row.get("bid", np.nan))
-                ask = float(row.get("ask", np.nan))
-                last = float(row.get("lastPrice", np.nan))
-
-                if not math.isnan(bid) and not math.isnan(ask) and ask > 0:
-                    price_used = 0.5 * (bid + ask)
-                elif not math.isnan(last):
-                    price_used = last
-                else:
-                    price_used = np.nan
-
-                iv_raw = float(row.get("impliedVolatility", np.nan))
-                if math.isnan(iv_raw) or iv_raw <= 0:
-                    iv_raw = 0.20  # simple fallback
-
-                vol = iv_raw  # 0.xx
-
-                greeks = bs_greeks(
-                    spot=spot,
-                    strike=strike,
-                    time=time,
-                    rate=rate,
-                    div_yield=dividend_yield,
-                    vol=vol,
-                    is_call=(opt_type == "call"),
-                )
-
-                volume = float(row.get("volume", 0.0))
-                open_interest = float(row.get("openInterest", 0.0))
-
-                rows.append(
-                    {
-                        "options_underlying": options_ticker,
-                        "price_underlying": ticker_clean,
-                        "contractSymbol": row.get("contractSymbol"),
-                        "type": opt_type,
-                        "expiry": expiry,
-                        "dte": dte,
-                        "strike": strike,
-                        "lastPrice": last,
-                        "bid": bid,
-                        "ask": ask,
-                        "price_used": price_used,
-                        "volume": volume,
-                        "openInterest": open_interest,
-                        "iv": iv_raw * 100.0,  # store IV in %
-                        "delta": greeks["delta"],
-                        "gamma": greeks["gamma"],
-                        "vega": greeks["vega"],
-                        "theta": greeks["theta"],
-                    }
-                )
-
-    chain = pd.DataFrame(rows)
-    if chain.empty:
-        raise RuntimeError(
-            f"Options chain for {options_ticker} came back empty."
-        )
-
-    chain["moneyness"] = chain["strike"] / spot - 1.0
-    chain["dollar_notional"] = chain["price_used"].fillna(0.0) * chain["volume"] * 100.0
-    chain["vol_oi_ratio"] = chain["volume"] / chain["openInterest"].replace(0, np.nan)
-
-    return chain
+    df["moneyness"] = df["strike"] / float(spot) - 1.0
+    return df
 
 
-# ---------------------------------------------------------------------
-# Put / call ratios
-# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Put/call ratios and gamma exposure
+# ---------------------------------------------------------------------------
 
 
-def compute_put_call_ratios(chain_df: pd.DataFrame) -> Dict[str, float]:
-    call_vol = chain_df.loc[chain_df["type"] == "call", "volume"].sum()
-    put_vol = chain_df.loc[chain_df["type"] == "put", "volume"].sum()
-    call_oi = chain_df.loc[chain_df["type"] == "call", "openInterest"].sum()
-    put_oi = chain_df.loc[chain_df["type"] == "put", "openInterest"].sum()
+def compute_put_call_ratios(chain_df: pd.DataFrame) -> Dict[str, Any]:
+    if chain_df.empty:
+        return {
+            "call_vol": 0.0,
+            "put_vol": 0.0,
+            "call_oi": 0.0,
+            "put_oi": 0.0,
+            "pcr_vol": float("nan"),
+            "pcr_oi": float("nan"),
+        }
 
-    pcr_vol = float(put_vol / call_vol) if call_vol > 0 else np.nan
-    pcr_oi = float(put_oi / call_oi) if call_oi > 0 else np.nan
+    calls = chain_df[chain_df["type"] == "call"]
+    puts = chain_df[chain_df["type"] == "put"]
+
+    call_vol = float(calls["volume"].sum())
+    put_vol = float(puts["volume"].sum())
+    call_oi = float(calls["openInterest"].sum())
+    put_oi = float(puts["openInterest"].sum())
+
+    pcr_vol = put_vol / call_vol if call_vol > 0 else float("nan")
+    pcr_oi = put_oi / call_oi if call_oi > 0 else float("nan")
 
     return {
-        "call_vol": float(call_vol),
-        "put_vol": float(put_vol),
-        "call_oi": float(call_oi),
-        "put_oi": float(put_oi),
+        "call_vol": call_vol,
+        "put_vol": put_vol,
+        "call_oi": call_oi,
+        "put_oi": put_oi,
         "pcr_vol": pcr_vol,
         "pcr_oi": pcr_oi,
     }
 
 
-# ---------------------------------------------------------------------
-# Gamma exposure / walls / zero-gamma
-# ---------------------------------------------------------------------
-
-
-def compute_gex(chain_df: pd.DataFrame, spot: float) -> pd.DataFrame:
+def compute_gamma_exposure_by_strike(
+    chain_df: pd.DataFrame,
+    spot: float,
+    contract_size: int = 100,
+) -> pd.DataFrame:
     """
-    Approximate per-strike gamma exposure.
-
-    gex ≈ gamma * spot^2 * openInterest * contract_multiplier (100)
-    sign: calls positive, puts negative.
+    Aggregate gamma exposure by strike across all expiries.
+    Positive = long gamma for the street, negative = short.
     """
+    if chain_df.empty:
+        return pd.DataFrame(columns=["strike", "gex", "total_oi", "call_oi", "put_oi", "cum_gex"])
+
     df = chain_df.copy()
-    df["gamma_dollar"] = df["gamma"] * (spot ** 2) * df["openInterest"] * 100.0
-    df.loc[df["type"] == "put", "gamma_dollar"] *= -1.0
+    df["gex_raw"] = df["gamma"] * df["openInterest"] * contract_size * (spot ** 2)
 
-    grouped = (
-        df.groupby("strike")
-        .agg(
-            gex=("gamma_dollar", "sum"),
-            total_oi=("openInterest", "sum"),
-            call_oi=(
-                "openInterest",
-                lambda x: x[df.loc[x.index, "type"] == "call"].sum(),
-            ),
-            put_oi=(
-                "openInterest",
-                lambda x: x[df.loc[x.index, "type"] == "put"].sum(),
-            ),
-        )
-        .reset_index()
-        .sort_values("strike")
+    # Calls positive gamma exposure, puts negative (dealer perspective)
+    df.loc[df["type"] == "put", "gex_raw"] *= -1.0
+
+    grouped = df.groupby("strike").agg(
+        gex=("gex_raw", "sum"),
+        total_oi=("openInterest", "sum"),
+        call_oi=("openInterest", lambda x: x[df.loc[x.index, "type"] == "call"].sum()),
+        put_oi=("openInterest", lambda x: x[df.loc[x.index, "type"] == "put"].sum()),
     )
+    grouped = grouped.sort_index().reset_index()
 
     grouped["cum_gex"] = grouped["gex"].cumsum()
+
     return grouped
 
 
-def summarize_gamma(grouped_gex: pd.DataFrame) -> Dict[str, Any]:
-    if grouped_gex.empty:
-        return {"call_wall": None, "put_wall": None, "zero_gamma": None}
+def summarize_gamma_levels(gex_table: pd.DataFrame, spot: float) -> Dict[str, Any]:
+    if gex_table.empty:
+        return {
+            "zero_gamma": None,
+            "call_walls": pd.DataFrame(),
+            "put_walls": pd.DataFrame(),
+        }
 
-    call_row = grouped_gex.loc[grouped_gex["gex"].idxmax()]
-    put_row = grouped_gex.loc[grouped_gex["gex"].idxmin()]
+    # Approx zero-gamma: strike where |cum_gex| is minimal
+    idx_z = gex_table["cum_gex"].abs().idxmin()
+    zero_gamma = float(gex_table.loc[idx_z, "strike"])
 
-    call_wall = float(call_row["strike"])
-    put_wall = float(put_row["strike"])
+    # Call wall = highest positive gex; put wall = most negative
+    call_walls = gex_table.sort_values("gex", ascending=False).head(5)
+    put_walls = gex_table.sort_values("gex").head(5)
 
-    # Zero-gamma: where cum_gex crosses zero
-    cg = grouped_gex["cum_gex"].values
-    strikes = grouped_gex["strike"].values
-    zero_level: Optional[float] = None
-    for i in range(1, len(cg)):
-        if cg[i - 1] <= 0 <= cg[i] or cg[i - 1] >= 0 >= cg[i]:
-            x0, x1 = strikes[i - 1], strikes[i]
-            y0, y1 = cg[i - 1], cg[i]
-            if y1 != y0:
-                zero_level = float(x0 + (x1 - x0) * (-y0) / (y1 - y0))
-            else:
-                zero_level = float(x0)
-            break
-
-    return {"call_wall": call_wall, "put_wall": put_wall, "zero_gamma": zero_level}
+    return {
+        "zero_gamma": zero_gamma,
+        "call_walls": call_walls,
+        "put_walls": put_walls,
+    }
 
 
-# ---------------------------------------------------------------------
-# Unusual options activity (intraday, percentile-based)
-# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Unusual flow detection
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -392,411 +344,217 @@ class UnusualConfig:
     notional_pct: float = 0.97
     volume_pct: float = 0.97
     vol_oi_pct: float = 0.97
-    # kept for compatibility with your UI – currently not used in logic
-    min_vol_vs_hist: float = 5.0
+    min_vol_vs_hist: float = 2.0
     min_oi_change_ratio: float = 0.5
     min_dollar_notional: float = 1_000_000.0
     max_dte_short: int = 7
 
 
-def flag_unusual_activity(chain_df: pd.DataFrame, config: UnusualConfig) -> pd.DataFrame:
+def _bucket_delta(delta: float) -> str:
+    if math.isnan(delta):
+        return "unknown"
+    a = abs(delta)
+    if a >= 0.75:
+        return "deep_itm"
+    if 0.35 <= a < 0.75:
+        return "atm"
+    if 0.15 <= a < 0.35:
+        return "otm"
+    return "lottery"
+
+
+def flag_unusual_activity(
+    chain_df: pd.DataFrame,
+    config: UnusualConfig,
+) -> pd.DataFrame:
+    """
+    Flag large / concentrated trades using only *today's* cross-section.
+    This avoids needing a persistent history on Streamlit.
+    """
+    if chain_df.empty:
+        return pd.DataFrame()
+
     df = chain_df.copy()
 
+    # Restrict to short-dated flow
+    df = df[df["dte"] <= config.max_dte_short].copy()
+    if df.empty:
+        return df
+
+    # Dollar notional
+    df["dollar_notional"] = df["price_used"].fillna(0.0) * df["volume"].fillna(0.0) * 100.0
+
+    # Basic ratios
+    df["vol_oi_ratio"] = (
+        df["volume"].astype(float)
+        / df["openInterest"].replace(0, np.nan).astype(float)
+    )
+    df["vol_oi_ratio"] = df["vol_oi_ratio"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    # Cross-sectional percentiles (per snapshot)
     df["notional_pct"] = df["dollar_notional"].rank(pct=True)
     df["volume_pct"] = df["volume"].rank(pct=True)
     df["vol_oi_pct"] = df["vol_oi_ratio"].rank(pct=True)
 
-    cond_big = df["dollar_notional"] >= config.min_dollar_notional
-    cond_notional = df["notional_pct"] >= config.notional_pct
-    cond_volume = df["volume_pct"] >= config.volume_pct
-    cond_vol_oi = df["vol_oi_pct"] >= config.vol_oi_pct
-    cond_short = df["dte"] <= config.max_dte_short
+    # Volume vs "history": use median per expiry & type as a stand-in baseline
+    grp_key = ["expiry", "type"]
+    med_vol = df.groupby(grp_key)["volume"].transform("median").replace(0, np.nan)
+    df["vol_vs_hist"] = (df["volume"] / med_vol).replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-    mask = cond_big & cond_short & (cond_notional | cond_volume | cond_vol_oi)
+    # We don't have real OI changes without a history database, so keep this neutral
+    df["oi_change_ratio"] = 1.0
+
+    # Filters
+    mask_big_notional = df["dollar_notional"] >= config.min_dollar_notional
+    mask_percentiles = (
+        (df["notional_pct"] >= config.notional_pct)
+        | (df["volume_pct"] >= config.volume_pct)
+        | (df["vol_oi_pct"] >= config.vol_oi_pct)
+    )
+    mask_oi_change = df["oi_change_ratio"] >= config.min_oi_change_ratio
+
+    # For now we require big notional AND percentile filters AND neutral OI change
+    mask = mask_big_notional & mask_percentiles & mask_oi_change
+
     unusual = df.loc[mask].copy()
-
     if unusual.empty:
         return unusual
 
-    reasons: List[str] = []
-    for _, row in unusual.iterrows():
-        r: List[str] = []
-        if row["dollar_notional"] >= config.min_dollar_notional:
-            r.append("big_notional")
-        if row["notional_pct"] >= config.notional_pct:
-            r.append("top_notional")
-        if row["volume_pct"] >= config.volume_pct:
-            r.append("top_volume")
-        if row["vol_oi_pct"] >= config.vol_oi_pct:
-            r.append("top_volOI")
-        if row["dte"] <= config.max_dte_short:
-            r.append(f"{int(row['dte'])}DTE")
-        reasons.append("|".join(r))
+    # Categorise delta & build "reason" string
+    unusual["delta_bucket"] = unusual["delta"].astype(float).apply(_bucket_delta)
 
-    unusual["reason"] = reasons
-    unusual = unusual.sort_values("dollar_notional", ascending=False)
+    def _reason(row: pd.Series) -> str:
+        reasons = ["big_notional"]
+        if row["notional_pct"] >= config.notional_pct:
+            reasons.append("notional_pct>thr")
+        if row["volume_pct"] >= config.volume_pct:
+            reasons.append("vol_pct>thr")
+        if row["vol_oi_pct"] >= config.vol_oi_pct:
+            reasons.append("volOI_pct>thr")
+        if row["vol_vs_hist"] >= config.min_vol_vs_hist:
+            reasons.append("vol_vs_hist>thr")
+        if row["oi_change_ratio"] >= config.min_oi_change_ratio:
+            reasons.append("OI_change>thr")
+        reasons.append(f"{int(row['dte'])}DTE")
+        return "|".join(reasons)
+
+    unusual["reason"] = unusual.apply(_reason, axis=1)
+
+    # Nice ordering of columns for the app
+    cols_order = [
+        "contractSymbol",
+        "type",
+        "expiry",
+        "dte",
+        "strike",
+        "price_used",
+        "volume",
+        "openInterest",
+        "dollar_notional",
+        "vol_oi_ratio",
+        "notional_pct",
+        "volume_pct",
+        "vol_oi_pct",
+        "vol_vs_hist",
+        "oi_change_ratio",
+        "iv",
+        "delta",
+        "gamma",
+        "vega",
+        "theta",
+        "moneyness",
+        "delta_bucket",
+        "reason",
+    ]
+    existing_cols = [c for c in cols_order if c in unusual.columns]
+    unusual = unusual[existing_cols].sort_values("dollar_notional", ascending=False)
+
     return unusual
 
 
-# ---------------------------------------------------------------------
-# Notional clusters by expiry & moneyness
-# ---------------------------------------------------------------------
-
-
 def build_notional_clusters(chain_df: pd.DataFrame, spot: float) -> pd.DataFrame:
-    df = chain_df.copy()
-    if df.empty:
-        return df
+    """
+    Aggregate notional by expiry and moneyness band (% from spot).
+    """
+    if chain_df.empty:
+        return pd.DataFrame()
 
-    # moneyness band in % (rounded)
-    df["moneyness_band"] = (100.0 * (df["strike"] / spot - 1.0)).round().astype(int)
+    df = chain_df.copy()
+    df["dollar_notional"] = df["price_used"].fillna(0.0) * df["openInterest"].fillna(0.0) * 100.0
+    df["moneyness_band"] = ((df["strike"] / spot - 1.0) * 100).round().astype(int)
 
     grouped = (
         df.groupby(["expiry", "moneyness_band"])
         .agg(
             total_notional=("dollar_notional", "sum"),
-            avg_moneyness=("moneyness", "mean"),
-            call_notional=(
-                "dollar_notional",
-                lambda x: x[df.loc[x.index, "type"] == "call"].sum(),
-            ),
-            put_notional=(
-                "dollar_notional",
-                lambda x: x[df.loc[x.index, "type"] == "put"].sum(),
-            ),
+            avg_moneyness=("moneyness_band", "mean"),
+            call_notional=("dollar_notional", lambda x: x[df.loc[x.index, "type"] == "call"].sum()),
+            put_notional=("dollar_notional", lambda x: x[df.loc[x.index, "type"] == "put"].sum()),
         )
         .reset_index()
     )
 
     grouped["net_call_minus_put"] = grouped["call_notional"] - grouped["put_notional"]
-    grouped = grouped.sort_values("total_notional", ascending=False).reset_index(drop=True)
     return grouped
 
 
-# ---------------------------------------------------------------------
-# Implied distribution / expected moves (from ATM IV)
-# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Volatility complex (IV vs RV, VIX, skew)
+# ---------------------------------------------------------------------------
 
-
-def pick_reference_expiry(
-    chain_df: pd.DataFrame, target_dte: int = 30, max_dte: int = 60
-) -> Optional[pd.Timestamp]:
-    if "expiry" not in chain_df.columns or "dte" not in chain_df.columns:
-        return None
-    exp = chain_df[["expiry", "dte"]].drop_duplicates().sort_values("dte")
-    if exp.empty:
-        return None
-
-    # Prefer expiries with dte >= target
-    candidates = exp[exp["dte"] >= target_dte]
-    if not candidates.empty:
-        return pd.to_datetime(candidates.iloc[0]["expiry"])
-
-    return pd.to_datetime(exp.iloc[-1]["expiry"])
-
-
-def atm_iv_for_expiry(
-    chain_df: pd.DataFrame, expiry: pd.Timestamp, spot: float
-) -> Optional[float]:
-    df = chain_df.copy()
-    df["expiry"] = pd.to_datetime(df["expiry"])
-    df = df[df["expiry"] == expiry]
-    if df.empty or "iv" not in df.columns:
-        return None
-
-    rows: List[Dict[str, float]] = []
-    for strike, g in df.groupby("strike"):
-        call_iv = g.loc[g["type"] == "call", "iv"].dropna()
-        put_iv = g.loc[g["type"] == "put", "iv"].dropna()
-        if call_iv.empty and put_iv.empty:
-            continue
-        if call_iv.empty:
-            iv_mid = float(put_iv.iloc[0])
-        elif put_iv.empty:
-            iv_mid = float(call_iv.iloc[0])
-        else:
-            iv_mid = float(0.5 * (call_iv.iloc[0] + put_iv.iloc[0]))
-        rows.append({"strike": strike, "iv_mid": iv_mid})
-
-    if not rows:
-        return None
-
-    tmp = pd.DataFrame(rows)
-    row_atm = tmp.iloc[(tmp["strike"] - spot).abs().argmin()]
-    return float(row_atm["iv_mid"])
-
-
-def implied_move_stats(
-    spot: float, atm_iv_annual_pct: float, horizons_days: Sequence[int] = (1, 5)
-) -> Dict[int, Dict[str, float]]:
-    if atm_iv_annual_pct is None or math.isnan(atm_iv_annual_pct):
-        return {}
-
-    vol_annual = atm_iv_annual_pct / 100.0
-    vol_daily = vol_annual / math.sqrt(252.0)
-
-    out: Dict[int, Dict[str, float]] = {}
-    for h in horizons_days:
-        sigma_h = vol_daily * math.sqrt(float(h))
-        move_1sigma_pts = spot * sigma_h
-        move_2sigma_pts = spot * 2.0 * sigma_h
-        out[int(h)] = {
-            "sigma_ret": sigma_h,
-            "move_1sigma_pct": sigma_h * 100.0,
-            "move_1sigma_pts": move_1sigma_pts,
-            "move_2sigma_pct": 2.0 * sigma_h * 100.0,
-            "move_2sigma_pts": move_2sigma_pts,
-            "p_gt_1sigma": 2.0 * (1.0 - _norm_cdf(1.0)),
-            "p_gt_2sigma": 2.0 * (1.0 - _norm_cdf(2.0)),
-        }
-    return out
-
-
-def compute_implied_distribution(
-    chain_df: pd.DataFrame, spot: float, target_dte: int = 30
-) -> Dict[str, Any]:
-    ref_expiry = pick_reference_expiry(chain_df, target_dte=target_dte)
-    if ref_expiry is None:
-        return {}
-    atm_iv = atm_iv_for_expiry(chain_df, ref_expiry, spot)
-    if atm_iv is None:
-        return {}
-    moves = implied_move_stats(spot, atm_iv, horizons_days=(1, 5))
-    dte = int(chain_df.loc[chain_df["expiry"] == ref_expiry, "dte"].iloc[0])
-    return {"ref_expiry": ref_expiry, "dte": dte, "atm_iv": atm_iv, "moves": moves}
-
-
-# ---------------------------------------------------------------------
-# Vol surface snapshot (ATM + 25Δ RR & butterfly) with simple history
-# ---------------------------------------------------------------------
-
-
-def _find_delta_option(
-    df: pd.DataFrame, opt_type: str, target_delta: float, band: float = 0.15
-) -> Optional[float]:
-    if "delta" not in df.columns or "iv" not in df.columns:
-        return None
-    if opt_type == "call":
-        sub = df[
-            (df["type"] == "call")
-            & (df["delta"] >= target_delta - band)
-            & (df["delta"] <= target_delta + band)
-        ]
-    else:
-        sub = df[
-            (df["type"] == "put")
-            & (df["delta"] <= target_delta + band)
-            & (df["delta"] >= target_delta - band)
-        ]
-    if sub.empty:
-        return None
-    row = sub.iloc[(sub["delta"] - target_delta).abs().argmin()]
-    return float(row["iv"])
-
-
-def vol_surface_snapshot(chain_df: pd.DataFrame, spot: float) -> pd.DataFrame:
-    df = chain_df.copy()
-    df["expiry"] = pd.to_datetime(df["expiry"])
-    out_rows: List[Dict[str, Any]] = []
-    for expiry, g in df.groupby("expiry"):
-        dte = int(g["dte"].iloc[0])
-        atm = atm_iv_for_expiry(df, expiry, spot)
-        if atm is None:
-            continue
-        call25_iv = _find_delta_option(g, "call", 0.25)
-        put25_iv = _find_delta_option(g, "put", -0.25)
-        if call25_iv is None or put25_iv is None:
-            rr_25 = None
-            bf_25 = None
-        else:
-            rr_25 = float(put25_iv - call25_iv)
-            bf_25 = float(0.5 * (put25_iv + call25_iv) - atm)
-        out_rows.append(
-            {
-                "expiry": expiry,
-                "dte": dte,
-                "atm_iv": atm,
-                "call25_iv": call25_iv,
-                "put25_iv": put25_iv,
-                "rr_25": rr_25,
-                "bf_25": bf_25,
-            }
-        )
-    if not out_rows:
-        return pd.DataFrame(
-            columns=["expiry", "dte", "atm_iv", "call25_iv", "put25_iv", "rr_25", "bf_25"]
-        )
-    res = pd.DataFrame(out_rows).sort_values("dte").reset_index(drop=True)
-    return res
-
-
-def update_vol_surface_history(
-    snapshot_df: pd.DataFrame, history_path: str = "vol_surface_history.parquet"
-) -> pd.DataFrame:
-    if snapshot_df.empty:
-        return pd.DataFrame()
-    today = pd.Timestamp.today().normalize()
-    snap = snapshot_df.copy()
-    snap["asof_date"] = today
-    path = Path(history_path)
-    if path.exists():
-        try:
-            hist = pd.read_parquet(path)
-        except Exception:
-            hist = pd.DataFrame()
-    else:
-        hist = pd.DataFrame()
-    if not hist.empty:
-        hist = hist[hist["asof_date"] != today]
-        hist_all = pd.concat([hist, snap], ignore_index=True)
-    else:
-        hist_all = snap
-    hist_all.to_parquet(path, index=False)
-    return hist_all
-
-
-def add_vol_surface_ranks(
-    snapshot_df: pd.DataFrame,
-    history_df: Optional[pd.DataFrame],
-    lookback_days: int = 90,
-    dte_tolerance: int = 7,
-) -> pd.DataFrame:
-    snap = snapshot_df.copy()
-    snap["atm_iv_rank"] = np.nan
-    snap["rr_25_rank"] = np.nan
-    snap["bf_25_rank"] = np.nan
-
-    if history_df is None or history_df.empty:
-        return snap
-    hist = history_df.copy()
-    hist["asof_date"] = pd.to_datetime(hist["asof_date"]).dt.normalize()
-    cutoff = pd.Timestamp.today().normalize() - pd.Timedelta(days=lookback_days)
-    hist = hist[hist["asof_date"] >= cutoff]
-    if hist.empty:
-        return snap
-    for idx, row in snap.iterrows():
-        dte = row["dte"]
-        mask = hist["dte"].between(dte - dte_tolerance, dte + dte_tolerance)
-        h = hist[mask]
-        if h.empty:
-            continue
-        for col, rank_col in [
-            ("atm_iv", "atm_iv_rank"),
-            ("rr_25", "rr_25_rank"),
-            ("bf_25", "bf_25_rank"),
-        ]:
-            vals = h[col].dropna().values
-            if vals.size == 0 or pd.isna(row[col]):
-                continue
-            rank = (vals < row[col]).mean()
-            snap.at[idx, rank_col] = rank
-    return snap
-
-
-# ---------------------------------------------------------------------
-# Narrative summary
-# ---------------------------------------------------------------------
-
-
-def build_narrative(
-    spot: float,
-    pcr_info: Dict[str, float],
-    gamma_summary: Dict[str, Any],
-    unusual_df: pd.DataFrame,
-    clusters_df: pd.DataFrame,
-    implied_dist: Dict[str, Any],
-) -> str:
-    lines: List[str] = []
-    lines.append(f"Spot ≈ {spot:.2f}.")
-    if pcr_info.get("pcr_vol") is not None and not math.isnan(pcr_info["pcr_vol"]):
-        lines.append(
-            f" Intraday options flow put/call volume ratio ≈ {pcr_info['pcr_vol']:.2f}, "
-            f"open-interest PCR ≈ {pcr_info['pcr_oi']:.2f}."
-        )
-    if gamma_summary.get("zero_gamma") is not None:
-        zg = gamma_summary["zero_gamma"]
-        lines.append(
-            f" Approx zero-gamma level around {zg:.1f} with call-wall near "
-            f"{gamma_summary['call_wall']:.1f} and put-wall near {gamma_summary['put_wall']:.1f}."
-        )
-    if implied_dist:
-        mv1 = implied_dist["moves"][1]["move_1sigma_pts"]
-        lines.append(
-            f" Options-implied 1D 1σ move is about ±{mv1:.1f} points from spot."
-        )
-    if not unusual_df.empty:
-        top_notional = unusual_df["dollar_notional"].nlargest(3).sum() / 1e6
-        lines.append(
-            f" Top flagged unusual lines sum to roughly ${top_notional:.1f}M notional."
-        )
-    if not clusters_df.empty:
-        big_cluster = clusters_df.iloc[0]
-        lines.append(
-            f" Largest notional cluster sits at expiry {big_cluster['expiry'].date()} "
-            f"around moneyness band {big_cluster['moneyness_band']}%."
-        )
-    return "".join(lines)
-
-
-# ---------------------------------------------------------------------
-# Orchestrator
-# ---------------------------------------------------------------------
-
-# =====================================================================
-# Volatility Complex – regime view helpers
-# Re-introduces vol_complex_summary so app.py can import it.
-# =====================================================================
 
 def compute_realized_vol(price_df: pd.DataFrame, window: int = 20) -> float:
-    """
-    20D realized volatility (annualized, in %), based on log returns.
-    """
-    close = price_df["Close"].dropna()
-    if close.shape[0] <= window:
+    if price_df.empty or price_df.shape[0] < window + 1:
         return float("nan")
-
-    rets = np.log(close).diff().dropna()
-    rv = rets.rolling(window).std().iloc[-1] * math.sqrt(252.0) * 100.0
+    close = price_df["Close"].astype(float)
+    ret = np.log(close / close.shift(1)).dropna()
+    rv = ret.rolling(window=window).std().iloc[-1] * math.sqrt(252.0) * 100.0
     return float(rv)
 
 
 def compute_atm_iv_30d(chain_df: pd.DataFrame, spot: float) -> float:
     """
-    30D-ish ATM implied vol (in %), using the same machinery
-    as compute_implied_distribution.
+    Very simple proxy: average IV of options with 20–40 DTE and |moneyness| < 2%.
     """
-    info = compute_implied_distribution(chain_df, spot, target_dte=30)
-    if not info:
+    if chain_df.empty:
         return float("nan")
-    atm_iv = info.get("atm_iv", np.nan)
-    return float(atm_iv) if atm_iv is not None else float("nan")
+
+    df = chain_df.copy()
+    mask = (df["dte"].between(20, 40)) & (df["moneyness"].abs() <= 0.02)
+    subset = df.loc[mask]
+    if subset.empty:
+        return float("nan")
+    return float(subset["iv"].mean() * 100.0)
 
 
 def compute_skew_30d(chain_df: pd.DataFrame, spot: float) -> float:
     """
-    30D skew ≈ (25Δ put IV – 25Δ call IV), in vol points.
+    30D 25Δ skew = (25Δ put IV – 25Δ call IV) in vol points.
+    We'll approximate 25Δ by bucket on delta.
     """
-    ref_expiry = pick_reference_expiry(chain_df, target_dte=30)
-    if ref_expiry is None:
+    if chain_df.empty:
         return float("nan")
 
     df = chain_df.copy()
-    df["expiry"] = pd.to_datetime(df["expiry"])
-    g = df[df["expiry"] == ref_expiry]
-    if g.empty:
+    mask_30d = df["dte"].between(20, 40)
+    df = df.loc[mask_30d]
+    if df.empty:
         return float("nan")
 
-    put25_iv = _find_delta_option(g, "put", target_delta=-0.25)
-    call25_iv = _find_delta_option(g, "call", target_delta=0.25)
-    if put25_iv is None or call25_iv is None:
+    puts = df[(df["type"] == "put") & (df["delta"].between(-0.35, -0.15))]
+    calls = df[(df["type"] == "call") & (df["delta"].between(0.15, 0.35))]
+
+    if puts.empty or calls.empty:
         return float("nan")
 
-    return float(put25_iv - call25_iv)
+    put_iv = puts["iv"].mean() * 100.0
+    call_iv = calls["iv"].mean() * 100.0
+    return float(put_iv - call_iv)
 
 
 def fetch_vix_term_structure(period: str = "6mo") -> pd.DataFrame:
     """
-    Fetch ^VIX and ^VIX3M history for the regime view.
+    Fetch ^VIX and ^VIX3M history.
     Returns DataFrame indexed by date with columns '^VIX' and '^VIX3M'.
     """
     tickers = ["^VIX", "^VIX3M"]
@@ -804,32 +562,27 @@ def fetch_vix_term_structure(period: str = "6mo") -> pd.DataFrame:
     if raw.empty:
         return pd.DataFrame()
 
-    # Handle multi-index columns from yfinance
     if isinstance(raw.columns, pd.MultiIndex):
         adj = raw.xs("Adj Close", axis=1, level=0, drop_level=True)
     else:
         adj = raw[["Adj Close"]]
 
-    df = adj.copy()
-    # ensure column names contain the tickers for the existing plotting code
-    col_map = {}
-    for c in df.columns:
-        if "VIX3M" in str(c):
-            col_map[c] = "^VIX3M"
-        elif "VIX" in str(c):
-            col_map[c] = "^VIX"
-    if col_map:
-        df = df.rename(columns=col_map)
-
+    # In the multi-index case columns will be tickers; in the single-index case we only have one
+    if isinstance(adj, pd.DataFrame) and set(tickers).issubset(adj.columns):
+        df = adj[tickers].copy()
+    else:
+        # Fallback: best-effort rename if possible
+        df = adj.copy()
+    df.index.name = "Date"
     return df.dropna(how="all")
 
 
 def fetch_yield_curve(period: str = "6mo") -> pd.DataFrame:
     """
-    Fetch 10Y (^TNX) and 3M (^IRX) yields from yfinance.
-    Returns DataFrame with columns ['10Y', '3M', 'slope'] in %.
+    Fetch 10Y and 3M US yields (TNX / IRX). Returned in %.
     """
-    raw = yf.download(["^TNX", "^IRX"], period=period, interval="1d", auto_adjust=False)
+    tickers = ["^TNX", "^IRX"]
+    raw = yf.download(tickers, period=period, interval="1d", auto_adjust=False)
     if raw.empty:
         return pd.DataFrame()
 
@@ -839,20 +592,22 @@ def fetch_yield_curve(period: str = "6mo") -> pd.DataFrame:
         adj = raw[["Adj Close"]]
 
     df = adj.copy()
-    col_map = {}
-    for c in df.columns:
-        name = str(c)
-        if "TNX" in name:
-            col_map[c] = "10Y"
-        elif "IRX" in name:
-            col_map[c] = "3M"
-    df = df.rename(columns=col_map)
 
+    col_map = {}
+    for col in df.columns:
+        if "TNX" in str(col).upper():
+            col_map[col] = "10Y"
+        elif "IRX" in str(col).upper():
+            col_map[col] = "3M"
+    if col_map:
+        df = df.rename(columns=col_map)
     if "10Y" not in df.columns or "3M" not in df.columns:
         return pd.DataFrame()
 
-    # yfinance gives yields in % pts already
+    df["10Y"] = df["10Y"] / 100.0
+    df["3M"] = df["3M"] / 100.0
     df["slope"] = df["10Y"] - df["3M"]
+    df.index.name = "Date"
     return df.dropna(how="any")
 
 
@@ -872,12 +627,11 @@ def fetch_credit_series(period: str = "6mo") -> tuple[pd.DataFrame, float, float
 
     df = adj.copy()
     col_map = {}
-    for c in df.columns:
-        name = str(c)
-        if "HYG" in name:
-            col_map[c] = "HYG"
-        elif "LQD" in name:
-            col_map[c] = "LQD"
+    for col in df.columns:
+        if "HYG" in str(col).upper():
+            col_map[col] = "HYG"
+        elif "LQD" in str(col).upper():
+            col_map[col] = "LQD"
     if col_map:
         df = df.rename(columns=col_map)
 
@@ -896,6 +650,7 @@ def fetch_credit_series(period: str = "6mo") -> tuple[pd.DataFrame, float, float
         z_last = float("nan")
         out["z"] = np.nan
 
+    out.index.name = "Date"
     return out, level, z_last
 
 
@@ -910,22 +665,32 @@ def fetch_dollar_series(period: str = "6mo") -> tuple[pd.DataFrame, float, str]:
     if isinstance(raw.columns, pd.MultiIndex):
         adj = raw.xs("Adj Close", axis=1, level=0, drop_level=True)
         if isinstance(adj, pd.DataFrame):
-            s = adj.iloc[:, 0]
+            if "UUP" in adj.columns:
+                df = adj[["UUP"]].copy()
+            else:
+                df = adj.iloc[:, [0]].copy()
         else:
-            s = adj
+            df = adj.to_frame(name="UUP")
     else:
-        s = raw["Adj Close"]
+        df = raw[["Adj Close"]].copy()
+        df = df.rename(columns={"Adj Close": "UUP"})
 
-    df = s.to_frame(name="UUP")
+    df.index.name = "Date"
+
+    if df.shape[0] < 5:
+        last = float(df["UUP"].iloc[-1])
+        return df, last, "n/a"
+
     last = float(df["UUP"].iloc[-1])
-
-    # very simple trend label over last ~60 trading days
-    if len(df) > 20:
-        window = min(60, len(df))
-        s_slice = df["UUP"].iloc[-window:]
-        slope = float(s_slice.iloc[-1] - s_slice.iloc[0])
+    # Simple trend classification: slope of last 20d
+    series = df["UUP"].astype(float)
+    x = np.arange(len(series[-20:]))
+    y = series[-20:].values
+    if len(x) >= 2:
+        coeffs = np.polyfit(x, y, 1)
+        slope = coeffs[0]
     else:
-        slope = float(df["UUP"].iloc[-1] - df["UUP"].iloc[0])
+        slope = 0.0
 
     if slope > 0:
         regime = "uptrend / stronger dollar"
@@ -937,28 +702,22 @@ def fetch_dollar_series(period: str = "6mo") -> tuple[pd.DataFrame, float, str]:
     return df, last, regime
 
 
-def vol_complex_summary(price_df: pd.DataFrame,
-                        chain_df: pd.DataFrame) -> Dict[str, Any]:
+def vol_complex_summary(price_df: pd.DataFrame, chain_df: pd.DataFrame) -> Dict[str, Any]:
     """
-    High-level volatility regime summary + tidy data for the 'Volatility
-    Complex – Regime View' page in the app.
-
-    Returns a dict with:
-      - rv20, atm_iv_30d, iv_rv_ratio, iv_vs_rv_label, skew_30d
-      - vix_df, spot_vix, spot_vix3m, term_structure_label
-      - yield_curve_df, yc_10y, yc_3m, yc_slope
-      - credit_df, credit_level, credit_z
-      - uup_df, uup_last, uup_regime
+    Pull together IV vs RV, VIX term structure and skew into a compact summary.
     """
-    spot = float(price_df["Close"].iloc[-1])
+    if price_df.empty:
+        rv20 = float("nan")
+    else:
+        rv20 = compute_realized_vol(price_df, window=20)
 
-    rv20 = compute_realized_vol(price_df, window=20)
+    spot = float(price_df["Close"].iloc[-1]) if not price_df.empty else float("nan")
     atm_iv_30d = compute_atm_iv_30d(chain_df, spot)
     skew_30d = compute_skew_30d(chain_df, spot)
 
     iv_rv_ratio = (
-        float(atm_iv_30d / rv20)
-        if rv20 and not math.isnan(rv20) and rv20 != 0
+        atm_iv_30d / rv20
+        if rv20 and not math.isnan(rv20) and rv20 != 0 and atm_iv_30d and not math.isnan(atm_iv_30d)
         else float("nan")
     )
 
@@ -973,9 +732,9 @@ def vol_complex_summary(price_df: pd.DataFrame,
 
     # VIX term structure
     vix_df = fetch_vix_term_structure(period="6mo")
-    if not vix_df.empty:
-        spot_vix = float(vix_df.iloc[-1].get("^VIX", np.nan))
-        spot_vix3m = float(vix_df.iloc[-1].get("^VIX3M", np.nan))
+    if not vix_df.empty and "^VIX" in vix_df.columns and "^VIX3M" in vix_df.columns:
+        spot_vix = float(vix_df["^VIX"].iloc[-1])
+        spot_vix3m = float(vix_df["^VIX3M"].iloc[-1])
     else:
         spot_vix = float("nan")
         spot_vix3m = float("nan")
@@ -984,52 +743,156 @@ def vol_complex_summary(price_df: pd.DataFrame,
     if not math.isnan(spot_vix) and not math.isnan(spot_vix3m):
         spread = spot_vix3m - spot_vix
         if spread > 3.0:
-            term_label = "calm contango"
-        elif spread > 1.0:
-            term_label = "mild contango"
-        elif spread > -1.0:
-            term_label = "flat"
+            term_label = f"calm contango (3M–spot ≈ +{spread:.1f} vol pts)"
+        elif spread < 0:
+            term_label = f"backwardation / stress (3M–spot ≈ {spread:.1f} vol pts)"
         else:
-            term_label = "backwardation / stress"
+            term_label = f"flat / mildly upward (3M–spot ≈ +{spread:.1f} vol pts)"
 
-    # Yield curve
-    yc_df = fetch_yield_curve(period="6mo")
-    if not yc_df.empty:
-        yc_10y = float(yc_df["10Y"].iloc[-1])
-        yc_3m = float(yc_df["3M"].iloc[-1])
-        yc_slope = float(yc_df["slope"].iloc[-1])
+    # Skew label
+    if math.isnan(skew_30d):
+        skew_label = "n/a"
+    elif skew_30d > 3.0:
+        skew_label = "steep downside skew (puts rich vs calls)"
+    elif skew_30d < 0.5:
+        skew_label = "flat / inverted skew (little downside premium)"
     else:
-        yc_10y = yc_3m = yc_slope = float("nan")
+        skew_label = "mild downside skew"
 
-    # Credit
-    credit_df, credit_level, credit_z = fetch_credit_series(period="6mo")
-
-    # Dollar
-    uup_df, uup_last, uup_regime = fetch_dollar_series(period="6mo")
+    # Tidy VIX for plotting
+    if vix_df.empty:
+        vix_long = pd.DataFrame(columns=["Date", "Index", "Level"])
+    else:
+        rename_map = {}
+        for c in vix_df.columns:
+            if "VIX3M" in str(c).upper():
+                rename_map[c] = "VIX3M"
+            elif "VIX" in str(c).upper():
+                rename_map[c] = "VIX"
+        vix_plot = vix_df.rename(columns=rename_map)
+        cols = [c for c in vix_plot.columns if c in ("VIX", "VIX3M")]
+        vix_plot = vix_plot[cols]
+        vix_long = (
+            vix_plot.reset_index(names="Date")
+            .melt(id_vars="Date", var_name="Index", value_name="Level")
+        )
 
     return {
         "rv20": rv20,
         "atm_iv_30d": atm_iv_30d,
         "iv_rv_ratio": iv_rv_ratio,
         "iv_vs_rv_label": iv_label,
+        "iv_rv_label": iv_label,  # alias for the app
         "skew_30d": skew_30d,
+        "skew_label": skew_label,
+        "vix": spot_vix,
+        "vix3m": spot_vix3m,
+        "vix_term_label": term_label,
         "vix_df": vix_df,
-        "spot_vix": spot_vix,
-        "spot_vix3m": spot_vix3m,
-        "term_structure_label": term_label,
-        "yield_curve_df": yc_df,
-        "yc_10y": yc_10y,
-        "yc_3m": yc_3m,
-        "yc_slope": yc_slope,
-        "credit_df": credit_df,
-        "credit_level": credit_level,
-        "credit_z": credit_z,
-        "uup_df": uup_df,
-        "uup_last": uup_last,
-        "uup_regime": uup_regime,
+        "vix_long_df": vix_long,
     }
 
 
+# ---------------------------------------------------------------------------
+# Macro tape (rates, credit, dollar)
+# ---------------------------------------------------------------------------
+
+
+def macro_tape_summary(period: str = "6mo") -> Dict[str, Any]:
+    """
+    Summarise rates (10Y vs 3M), credit (HYG/LQD) and dollar (UUP)
+    into a compact macro "tape".
+    """
+    yc_df = fetch_yield_curve(period=period)
+    credit_df, credit_level, credit_z = fetch_credit_series(period=period)
+    uup_df, uup_last, uup_regime = fetch_dollar_series(period=period)
+
+    # Rates metrics
+    if yc_df.empty:
+        last_10y = last_3m = yc_slope = float("nan")
+        rates_regime = "n/a"
+    else:
+        last_row = yc_df.iloc[-1]
+        last_10y = float(last_row["10Y"])
+        last_3m = float(last_row["3M"])
+        yc_slope = float(last_row["slope"])
+        if yc_slope < -0.005:
+            rates_regime = "deep inversion / late-cycle risk"
+        elif yc_slope < 0.0:
+            rates_regime = "flat / mild inversion"
+        else:
+            rates_regime = "steepening / macro tailwind"
+
+    # Credit metrics
+    if credit_df.empty or math.isnan(credit_level):
+        credit_regime = "n/a"
+    else:
+        if credit_z < -1.0:
+            credit_regime = "risk-off / stress"
+        elif credit_z > 1.0:
+            credit_regime = "risk-on / stretched"
+        else:
+            credit_regime = "neutral"
+
+    # Dollar metrics (already labelled in helper)
+    if uup_df.empty or math.isnan(uup_last):
+        dollar_regime = "n/a"
+    else:
+        dollar_regime = uup_regime
+
+    # Tidy dataframes for plotting
+    if yc_df.empty:
+        yc_tidy = pd.DataFrame(columns=["Date", "Tenor", "Yield"])
+    else:
+        yc_tidy = (
+            yc_df[["10Y", "3M"]]
+            .reset_index(names="Date")
+            .melt(id_vars="Date", var_name="Tenor", value_name="Yield")
+        )
+
+    if credit_df.empty:
+        credit_tidy = pd.DataFrame(columns=["Date", "HYG/LQD"])
+    else:
+        credit_tidy = (
+            credit_df[["HYG_LQD"]]
+            .rename(columns={"HYG_LQD": "HYG/LQD"})
+            .reset_index(names="Date")
+        )
+
+    if uup_df.empty:
+        dollar_tidy = pd.DataFrame(columns=["Date", "UUP"])
+    else:
+        dollar_tidy = uup_df.reset_index(names="Date")
+
+    metrics = {
+        "rates": {
+            "last_10y": last_10y,
+            "last_3m": last_3m,
+            "slope": yc_slope,
+            "regime": rates_regime,
+        },
+        "credit": {
+            "last_ratio": credit_level,
+            "zscore": credit_z,
+            "regime": credit_regime,
+        },
+        "dollar": {
+            "last": uup_last,
+            "regime": dollar_regime,
+        },
+    }
+
+    return {
+        "metrics": metrics,
+        "yield_curve_df": yc_tidy,
+        "credit_df": credit_tidy,
+        "dollar_df": dollar_tidy,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
 
 
 def run_full_analysis(
@@ -1040,6 +903,7 @@ def run_full_analysis(
     max_expiries: int = 3,
     rate: float = 0.04,
     dividend_yield: float = 0.012,
+    history_lookback_days: int = 60,  # kept for compatibility with the app
     unusual_config: Optional[UnusualConfig] = None,
 ) -> Dict[str, Any]:
     """
@@ -1049,49 +913,63 @@ def run_full_analysis(
     if unusual_config is None:
         unusual_config = UnusualConfig()
 
-    # price
     price_df = get_price_history(ticker, period=price_period, interval=price_interval)
+    if price_df.empty:
+        raise ValueError(f"No price data for {ticker}")
+
     spot = float(price_df["Close"].iloc[-1])
 
-    # options chain
-    chain_df = get_options_chain(
-        ticker=ticker,
-        expiries=expiries,
-        max_expiries=max_expiries,
-        rate=rate,
-        dividend_yield=dividend_yield,
-    )
+    chain_df = fetch_option_chain(ticker, expiries=expiries, max_expiries=max_expiries)
+    if chain_df.empty:
+        raise ValueError(f"No option chain data for {ticker}")
 
-    # pcr
-    pcr_info = compute_put_call_ratios(chain_df)
+    # Greeks & derived fields
+    chain_df = enrich_with_greeks(chain_df, spot=spot, rate=rate, dividend_yield=dividend_yield)
 
-    # gamma
-    gex_table = compute_gex(chain_df, spot)
-    gamma_info = summarize_gamma(gex_table)
+    # Put/call ratios
+    pcr_info = {"overall": compute_put_call_ratios(chain_df)}
 
-    # unusual
+    # Gamma exposure
+    gex_table = compute_gamma_exposure_by_strike(chain_df, spot=spot)
+    gamma_info = summarize_gamma_levels(gex_table, spot=spot)
+
+    # Unusual activity & notional clusters
     unusual_df = flag_unusual_activity(chain_df, unusual_config)
+    clusters_df = build_notional_clusters(chain_df, spot=spot)
 
-    # clusters
-    clusters_df = build_notional_clusters(chain_df, spot)
+    # Narrative summary for the main page
+    overall = pcr_info["overall"]
+    pcr_vol = overall["pcr_vol"]
+    pcr_oi = overall["pcr_oi"]
+    zero_gamma = gamma_info["zero_gamma"]
+    call_wall = gamma_info["call_walls"]["strike"].iloc[0] if not gamma_info["call_walls"].empty else None
+    put_wall = gamma_info["put_walls"]["strike"].iloc[0] if not gamma_info["put_walls"].empty else None
 
-    # implied distribution
-    implied_dist = compute_implied_distribution(chain_df, spot)
+    narrative_lines = [f"Spot ≈ {spot:.2f}. "]
+    if not math.isnan(pcr_vol):
+        narrative_lines.append(
+            f"Intraday flow is "
+            f"{'put-heavy' if pcr_vol > 1.0 else 'call-biased' if pcr_vol < 0.8 else 'balanced'} "
+            f"(PCR_vol ≈ {pcr_vol:.2f}). "
+        )
+    if not math.isnan(pcr_oi):
+        narrative_lines.append(
+            f"Outstanding positioning is "
+            f"{'put-heavy' if pcr_oi > 1.2 else 'balanced'} "
+            f"(PCR_OI ≈ {pcr_oi:.2f}). "
+        )
+    if zero_gamma is not None:
+        narrative_lines.append(f"Approx zero-gamma level near {zero_gamma:.1f}. ")
+    if call_wall is not None and put_wall is not None:
+        narrative_lines.append(
+            f"Key gamma levels: call_wall ≈ {call_wall:.1f}, put_wall ≈ {put_wall:.1f}."
+        )
 
-    # vol surface + history
-    vol_surf_today = vol_surface_snapshot(chain_df, spot)
-    vol_hist = update_vol_surface_history(vol_surf_today)
-    vol_surf_today = add_vol_surface_ranks(vol_surf_today, vol_hist)
+    narrative = "".join(narrative_lines)
 
-    # narrative
-    narrative = build_narrative(
-        spot=spot,
-        pcr_info=pcr_info,
-        gamma_summary=gamma_info,
-        unusual_df=unusual_df,
-        clusters_df=clusters_df,
-        implied_dist=implied_dist,
-    )
+    # Volatility complex & macro tape
+    vol_info = vol_complex_summary(price_df, chain_df)
+    macro = macro_tape_summary(period=price_period)
 
     return {
         "spot": spot,
@@ -1103,8 +981,6 @@ def run_full_analysis(
         "unusual_df": unusual_df,
         "clusters": clusters_df,
         "narrative": narrative,
-        # new advanced blocks (you can wire these into the app UI later)
-        "implied_dist": implied_dist,
-        "vol_surface": vol_surf_today,
-        "vol_surface_history": vol_hist,
+        "vol_info": vol_info,
+        "macro": macro,
     }
